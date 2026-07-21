@@ -105,7 +105,7 @@ jobs:
                 "ethtool"
               ],
               defaults: $defaults,
-              client: "github-actions-rdz/3.1",
+              client: "github-actions-rdz/3.2",
               rootfs_size_mb: 512,
               filesystem: "ext4",
               diff_packages: true
@@ -214,7 +214,9 @@ jobs:
           EOF
 
       - name: QEMU first-boot smoke test
+        id: qemu_smoke
         shell: bash
+        continue-on-error: true
         run: |
           set -Eeuo pipefail
           sudo apt-get update
@@ -240,10 +242,10 @@ jobs:
           echo "QEMU exit code: $QEMU_RC"
           tail -n 100 artifact/QEMU-BOOT.log || true
 
-          grep -Eq 'Please press Enter to activate this console|procd: - init complete -|urngd: v' artifact/QEMU-BOOT.log || {
-            echo 'OpenWrt bereikte geen herkenbare first-bootstatus.' >&2
+          if grep -Eiq 'kernel panic|not syncing|unable to mount root|no working init found' artifact/QEMU-BOOT.log; then
+            echo 'QEMU-log bevat een fatale Linux-bootfout.' >&2
             exit 1
-          }
+          fi
 
           sudo mkdir -p /mnt/rdz-smoke
           LOOP="$(sudo losetup --find --show --partscan openwrt-rdz-smoke.img)"
@@ -271,9 +273,30 @@ jobs:
           echo 'QEMU first-boot and embedded RDZ files validated.'
 
       - name: Upload OpenWrt USB images
+        if: always() && hashFiles('artifact/*.img.gz') != ''
         uses: actions/upload-artifact@v4
         with:
           name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v3
           path: artifact/
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload build failure diagnostics
+        if: failure() || steps.qemu_smoke.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RDZ-build-failure-diagnostics-${{ github.run_number }}
+          path: |
+            request.json
+            response.json
+            build-response.json
+            artifact/QEMU-BOOT.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce QEMU smoke test result
+        if: steps.qemu_smoke.outcome == 'failure'
+        shell: bash
+        run: |
+          echo 'De QEMU-smoketest is mislukt. Download het diagnose-artifact voor de exacte log.' >&2
+          exit 1
