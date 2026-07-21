@@ -26,7 +26,8 @@ return view.extend({
       callInterfaces(),
       callBoard(),
       execJson('/usr/libexec/rdzbridge-ethernet-status'),
-      execJson('/usr/libexec/rdzbridge-watchdog-status')
+      execJson('/usr/libexec/rdzbridge-watchdog-status'),
+      execJson('/usr/libexec/rdzbridge-connectivity-status')
     ]);
   },
 
@@ -62,6 +63,7 @@ return view.extend({
     var board = data[1] || {};
     var ethernet = data[2] || {};
     var watchdog = data[3] || {};
+    var connectivity = data[4] || {};
     var wwan = interfaces.find(function(i) { return i.interface === 'wwan'; }) || {};
     var lan = interfaces.find(function(i) { return i.interface === 'lan'; }) || {};
     var testHost = E('div', { style: 'margin-top:1em' });
@@ -85,6 +87,7 @@ return view.extend({
         E('table', { class: 'table' }, [
           line(_('Model'), board.model),
           line(_('OpenWrt'), board.release?.description),
+          line(_('Internetcontrole'), connectivity.status),
           line(_('WWAN-status'), wwan.up ? _('Verbonden') : _('Niet verbonden')),
           line(_('WWAN-apparaat'), wwan.l3_device || wwan.device),
           line(_('WWAN IPv4'), (wwan['ipv4-address'] || []).map(function(a) { return a.address + '/' + a.mask; }).join(', ')),
@@ -98,6 +101,10 @@ return view.extend({
           line(_('Laatste herstelactie'), watchdog.last_action || _('Geen'))
         ])
       ]),
+      connectivity.status === 'captive_portal' ? E('div', { class: 'alert-message warning' }, [
+        _('Een aanmeldpagina is vereist. '),
+        E('a', { href: connectivity.portal_url || 'http://neverssl.com/', target: '_blank', rel: 'noreferrer' }, _('Loginpagina openen'))
+      ]) : null,
       E('div', { style: 'display:flex;gap:.75em;flex-wrap:wrap;margin-top:1em' }, [
         testButton,
         E('button', { class: 'btn cbi-button cbi-button-action', click: ui.createHandlerFn(this, this.reconnect) }, _('WWAN herstellen')),
@@ -106,7 +113,7 @@ return view.extend({
         E('a', { class: 'btn cbi-button', href: L.url('admin/rdzbridge/overview') }, _('Terug'))
       ]),
       testHost
-    ]);
+    ].filter(Boolean));
   },
 
   handleSaveApply: null,

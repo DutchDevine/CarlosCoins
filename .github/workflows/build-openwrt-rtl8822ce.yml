@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
 
     env:
       OPENWRT_VERSION: '25.12.5'
@@ -22,6 +22,32 @@ jobs:
     steps:
       - name: Checkout GUI source
         uses: actions/checkout@v4
+
+      - name: Validate RDZ source tree
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          jq empty rdzbridge/root/usr/share/luci/menu.d/luci-app-rdzbridge.json
+          jq empty rdzbridge/root/usr/share/rpcd/acl.d/luci-app-rdzbridge.json
+
+          for SCRIPT in \
+            rdzbridge/root/etc/uci-defaults/98-rdzbridge-finalize \
+            rdzbridge/root/etc/init.d/rdzbridge-watchdog \
+            rdzbridge/root/usr/sbin/rdzbridge-watchdog \
+            rdzbridge/root/usr/libexec/rdzbridge-connectivity-status \
+            rdzbridge/root/usr/libexec/rdzbridge-ethernet-status \
+            rdzbridge/root/usr/libexec/rdzbridge-reconnect \
+            rdzbridge/root/usr/libexec/rdzbridge-security-status \
+            rdzbridge/root/usr/libexec/rdzbridge-watchdog-status; do
+            test -x "$SCRIPT"
+            sh -n "$SCRIPT"
+          done
+
+          test -s rdzbridge/root/www/luci-static/resources/view/rdzbridge/overview.js
+          test -s rdzbridge/root/www/luci-static/resources/view/rdzbridge/setup.js
+          test -s rdzbridge/root/www/luci-static/resources/view/rdzbridge/diagnostics.js
+          test -s rdzbridge/root/www/luci-static/resources/view/rdzbridge/security.js
+          test -s rdzbridge/root/www/luci-static/resources/view/rdzbridge/maintenance.js
 
       - name: Request customized image from official OpenWrt builder
         shell: bash
@@ -36,16 +62,6 @@ jobs:
           #!/bin/sh
           set -e
 
-          uci set network.lan.ipaddr='10.77.77.1'
-          uci set network.lan.netmask='255.255.255.0'
-          uci set dhcp.lan.start='100'
-          uci set dhcp.lan.limit='150'
-          uci set dhcp.lan.leasetime='12h'
-          uci set uhttpd.main.index_page='/cgi-bin/luci/admin/rdzbridge/overview'
-          uci commit network
-          uci commit dhcp
-          uci commit uhttpd
-
           cat > /tmp/rdzbridge-root.tar.gz.b64 <<'PAYLOAD_EOF'
           __RDZ_PAYLOAD__
           PAYLOAD_EOF
@@ -53,6 +69,11 @@ jobs:
           base64 -d /tmp/rdzbridge-root.tar.gz.b64 > /tmp/rdzbridge-root.tar.gz
           tar -xzf /tmp/rdzbridge-root.tar.gz -C /
           rm -f /tmp/rdzbridge-root.tar.gz /tmp/rdzbridge-root.tar.gz.b64
+
+          if [ -x /etc/uci-defaults/98-rdzbridge-finalize ]; then
+            /etc/uci-defaults/98-rdzbridge-finalize
+            rm -f /etc/uci-defaults/98-rdzbridge-finalize
+          fi
 
           rm -f /tmp/luci-indexcache
           exit 0
@@ -77,19 +98,22 @@ jobs:
                 "wpad-basic-mbedtls",
                 "kmod-r8169",
                 "r8169-firmware",
+                "uclient-fetch",
                 "iw",
                 "iwinfo",
                 "pciutils",
                 "ethtool"
               ],
               defaults: $defaults,
-              client: "github-actions-rdz/2.1",
+              client: "github-actions-rdz/3.0",
               rootfs_size_mb: 512,
               filesystem: "ext4",
               diff_packages: true
             }' > request.json
 
-          echo 'OpenWrt build request:'
+          jq -e '.packages | index("kmod-rtw88-8822ce") != null' request.json >/dev/null
+          jq -e '.packages | index("kmod-r8169") != null' request.json >/dev/null
+          jq -e '.packages | index("uclient-fetch") != null' request.json >/dev/null
           jq '{version,target,profile,packages,rootfs_size_mb,filesystem,diff_packages}' request.json
 
           HTTP_CODE="$(curl -4 --silent --show-error --location \
@@ -102,18 +126,13 @@ jobs:
 
           echo "Initial HTTP status: $HTTP_CODE"
           cat response.json | jq . || cat response.json
-
           if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "202" ]]; then
             echo 'The OpenWrt build server rejected the request.' >&2
             exit 1
           fi
 
           REQUEST_HASH="$(jq -r '.request_hash // empty' response.json)"
-          if [[ -z "$REQUEST_HASH" ]]; then
-            echo 'No request_hash returned by the OpenWrt build server.' >&2
-            exit 1
-          fi
-
+          test -n "$REQUEST_HASH"
           echo "Request hash: $REQUEST_HASH"
 
           for attempt in $(seq 1 180); do
@@ -121,25 +140,20 @@ jobs:
               --connect-timeout 30 --max-time 120 \
               --output response.json --write-out '%{http_code}' \
               "$ASU_URL/api/v1/build/$REQUEST_HASH")"
-
             STATUS="$(jq -r '.imagebuilder_status // .detail // "unknown"' response.json 2>/dev/null || echo unknown)"
             echo "Poll $attempt: HTTP $HTTP_CODE, status $STATUS"
-
             if [[ "$HTTP_CODE" == "200" && "$STATUS" == "done" ]]; then
               break
             fi
-
             if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "202" ]]; then
               cat response.json | jq . || cat response.json
               exit 1
             fi
-
             if [[ "$attempt" == "180" ]]; then
               echo 'Timed out waiting for the OpenWrt image build.' >&2
               cat response.json | jq . || cat response.json
               exit 1
             fi
-
             sleep 10
           done
 
@@ -150,71 +164,106 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           mkdir -p artifact
           BIN_DIR="$(jq -r '.bin_dir // empty' build-response.json)"
-          if [[ -z "$BIN_DIR" ]]; then
-            echo 'The completed response does not contain bin_dir.' >&2
-            exit 1
-          fi
+          test -n "$BIN_DIR"
 
           mapfile -t IMAGES < <(
             jq -r '.images[]?.name // empty' build-response.json |
             grep -E 'generic-ext4-combined(-efi)?[^/]*\.img\.gz$' || true
           )
-
           if [[ "${#IMAGES[@]}" -eq 0 ]]; then
-            echo 'No combined EXT4 x86 USB images were returned.' >&2
             jq '.images' build-response.json
             exit 1
           fi
 
           for IMAGE in "${IMAGES[@]}"; do
-            echo "Downloading $IMAGE"
             curl -4 --fail --show-error --location --retry 5 --retry-delay 5 \
               --output "artifact/$IMAGE" \
               "$ASU_URL/store/$BIN_DIR/$IMAGE"
           done
 
+          gzip -t artifact/*.img.gz
           cp build-response.json artifact/
           cd artifact
           sha256sum *.img.gz > RDZ-SHA256SUMS.txt
 
           cat > README-FIRST.txt <<'EOF'
-          RENZODEZWART.PL - OpenWrt x86/64 RTL8822CE met RDZ 5G Bridge GUI
+          RENZODEZWART.PL - OpenWrt x86/64 RDZ 5G Bridge
 
-          Ondersteunde netwerkhardware in deze build:
+          Hardware:
           - Realtek RTL8822CE wifi, PCI ID 10EC:C822
           - Realtek RTL8111/RTL8168 Ethernet, PCI ID 10EC:8168
 
-          Moderne UEFI-computer:
-          gebruik het bestand met generic-ext4-combined-efi in de naam.
+          Moderne UEFI-computer: gebruik de image met combined-efi.
+          Legacy BIOS: gebruik de image zonder -efi.
 
-          Legacy BIOS:
-          gebruik het bestand zonder '-efi'.
+          Schrijf het .img.gz-bestand rechtstreeks naar USB met balenaEtcher
+          of Rufus. Schakel Secure Boot zo nodig uit.
 
-          Schrijf het .img.gz-bestand rechtstreeks naar een USB-stick met
-          balenaEtcher of Rufus. Secure Boot moet normaal uitgeschakeld zijn.
+          Beheeradres: http://10.77.77.1
 
-          Open na het opstarten:
-          http://10.77.77.1
+          Eerste gebruik:
+          1. Stel een rootwachtwoord in.
+          2. Kies een wifi-signaal in de RDZ-wizard.
+          3. Vul het wifiwachtwoord in.
+          4. De router configureert WWAN, NAT, DHCP en Ethernet-out automatisch.
 
-          Het adres opent direct de RDZ 5G Bridge-interface. De normale LuCI-
-          functies blijven bereikbaar via de knoppen voor geavanceerd beheer.
-
-          Eerste configuratie:
-          1. Open Wifi instellen.
-          2. Scan met de Realtek-radio.
-          3. Selecteer de 5 GHz-hotspot van de telefoon.
-          4. Gebruik netwerknaam wwan, DHCP-client en firewallzone wan.
+          De image bevat automatische herstelcontrole, captive-portalherkenning,
+          diagnostiek en koppelingen voor configuratieback-up en herstel.
           EOF
 
-          ls -lah
+      - name: QEMU first-boot smoke test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+
+          LEGACY_IMAGE="$(find artifact -maxdepth 1 -type f -name '*generic-ext4-combined.img.gz' | head -n 1)"
+          test -n "$LEGACY_IMAGE"
+          gzip -dc "$LEGACY_IMAGE" > openwrt-rdz-smoke.img
+
+          set +e
+          timeout 150s qemu-system-x86_64 \
+            -m 512 -smp 2 -nographic -no-reboot \
+            -drive file=openwrt-rdz-smoke.img,format=raw,if=ide \
+            -netdev user,id=net0 -device e1000,netdev=net0 \
+            > artifact/QEMU-BOOT.log 2>&1
+          QEMU_RC=$?
+          set -e
+          echo "QEMU exit code: $QEMU_RC"
+          tail -n 100 artifact/QEMU-BOOT.log || true
+
+          sudo mkdir -p /mnt/rdz-smoke
+          LOOP="$(sudo losetup --find --show --partscan openwrt-rdz-smoke.img)"
+          cleanup() {
+            sudo umount /mnt/rdz-smoke 2>/dev/null || true
+            sudo losetup -d "$LOOP" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 20); do
+            [[ -b "${LOOP}p2" ]] && break
+            sleep 1
+          done
+          test -b "${LOOP}p2"
+          sudo mount -o ro,noload "${LOOP}p2" /mnt/rdz-smoke
+
+          test -s /mnt/rdz-smoke/www/luci-static/resources/view/rdzbridge/overview.js
+          test -s /mnt/rdz-smoke/www/luci-static/resources/view/rdzbridge/setup.js
+          test -s /mnt/rdz-smoke/usr/libexec/rdzbridge-connectivity-status
+          test -s /mnt/rdz-smoke/etc/config/rdzbridge
+          test ! -e /mnt/rdz-smoke/etc/uci-defaults/98-rdzbridge-finalize
+          grep -q '10.77.77.1' /mnt/rdz-smoke/etc/config/network
+          grep -q 'rdzbridge-watchdog' /mnt/rdz-smoke/etc/rc.d/*rdzbridge-watchdog
+
+          echo 'QEMU first-boot and embedded RDZ files validated.'
 
       - name: Upload OpenWrt USB images
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI
+          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v3
           path: artifact/
           if-no-files-found: error
           retention-days: 30

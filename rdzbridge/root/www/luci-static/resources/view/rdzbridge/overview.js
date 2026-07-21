@@ -32,6 +32,17 @@ function execJson(path) {
   }).catch(function() { return {}; });
 }
 
+function connectionBadge(status) {
+  switch (status) {
+  case 'online': return badge(_('Online'), true);
+  case 'captive_portal': return badge(_('Loginpagina vereist'), false);
+  case 'limited': return badge(_('Beperkte toegang'), null);
+  case 'no_address': return badge(_('Geen WWAN-adres'), false);
+  case 'disconnected': return badge(_('Wifi niet verbonden'), false);
+  default: return badge(_('Geen internet'), false);
+  }
+}
+
 return view.extend({
   load: function() {
     return Promise.all([
@@ -39,7 +50,8 @@ return view.extend({
       callBoard(),
       execJson('/usr/libexec/rdzbridge-ethernet-status'),
       execJson('/usr/libexec/rdzbridge-watchdog-status'),
-      execJson('/usr/libexec/rdzbridge-security-status')
+      execJson('/usr/libexec/rdzbridge-security-status'),
+      execJson('/usr/libexec/rdzbridge-connectivity-status')
     ]);
   },
 
@@ -62,10 +74,10 @@ return view.extend({
     var ethernet = data[2] || {};
     var watchdog = data[3] || {};
     var security = data[4] || {};
+    var connectivity = data[5] || {};
     var wwan = interfaces.find(function(i) { return i.interface === 'wwan'; }) || {};
     var lan = interfaces.find(function(i) { return i.interface === 'lan'; }) || {};
     var wifiDevice = (wwan.l3_device || wwan.device || '').replace(/^@/, '');
-    var online = watchdog.status === 'online' || (wwan.up && (wwan['ipv4-address'] || []).length > 0);
 
     var statusBox = E('div', { class: 'cbi-section' });
     var content = E('div', { class: 'cbi-section-node' });
@@ -77,14 +89,14 @@ return view.extend({
       ]));
     }
 
-    var internetValue = badge(online ? _('Online') : _('Offline'), online);
+    var internetValue = connectionBadge(connectivity.status);
     row(_('Internet via wifi'), internetValue);
     row(_('WWAN-adres'), value((wwan['ipv4-address'] || [])[0]?.address, _('Geen adres')));
     row(_('LAN-adres'), value((lan['ipv4-address'] || [])[0]?.address, '10.77.77.1'));
     row(_('Ethernet-out'), ethernet.present ? badge(ethernet.carrier ? _('Kabel actief') : _('Geen kabelverbinding'), !!ethernet.carrier) : badge(_('Niet gevonden'), false));
     row(_('Ethernetapparaat'), ethernet.present ? [ ethernet.device, ethernet.speed ? ' · ' + ethernet.speed + ' Mbit/s' : '', ethernet.driver ? ' · ' + ethernet.driver : '' ].join('') : '—');
     row(_('Ethernetverkeer'), ethernet.present ? _('Ontvangen %s · verzonden %s').format(bytes(ethernet.rx_bytes), bytes(ethernet.tx_bytes)) : '—');
-    row(_('Automatisch herstel'), watchdog.enabled === false ? badge(_('Uitgeschakeld'), false) : badge(watchdog.status === 'online' ? _('Actief en online') : _('Actief'), null));
+    row(_('Automatisch herstel'), watchdog.enabled === false ? badge(_('Uitgeschakeld'), false) : badge(_('Actief'), null));
     row(_('Beheerderswachtwoord'), security.configured ? badge(_('Ingesteld'), true) : badge(_('Nog instellen'), false));
     row(_('Router'), value(board.model, _('Onbekend x86-systeem')));
     row(_('OpenWrt'), value(board.release?.description, _('Onbekende versie')));
@@ -112,20 +124,19 @@ return view.extend({
     var actions = E('div', { style: 'display:flex;gap:.75em;flex-wrap:wrap;margin-top:1.25em' }, [
       E('a', { class: 'btn cbi-button cbi-button-action important', href: L.url('admin/rdzbridge/setup') }, _('Wifi kiezen')),
       reconnectButton,
+      connectivity.status === 'captive_portal' ? E('a', { class: 'btn cbi-button cbi-button-action important', href: connectivity.portal_url || 'http://neverssl.com/', target: '_blank', rel: 'noreferrer' }, _('Loginpagina openen')) : null,
       E('a', { class: 'btn cbi-button', href: L.url('admin/rdzbridge/diagnostics') }, _('Diagnose')),
       E('a', { class: 'btn cbi-button', href: L.url('admin/rdzbridge/security') }, _('Beveiliging')),
+      E('a', { class: 'btn cbi-button', href: L.url('admin/rdzbridge/maintenance') }, _('Back-up en herstel')),
       E('a', { class: 'btn cbi-button', href: L.url('admin/status/overview') }, _('Geavanceerd beheer'))
-    ]);
+    ].filter(Boolean));
 
     poll.add(function() {
-      return Promise.all([ callInterfaces(), execJson('/usr/libexec/rdzbridge-watchdog-status') ]).then(function(result) {
-        var current = (result[0].interface || []).find(function(i) { return i.interface === 'wwan'; }) || {};
-        var wd = result[1] || {};
-        var nowOnline = wd.status === 'online' || (current.up && (current['ipv4-address'] || []).length > 0);
+      return execJson('/usr/libexec/rdzbridge-connectivity-status').then(function(current) {
         if (internetValue.isConnected)
-          internetValue.replaceWith(internetValue = badge(nowOnline ? _('Online') : _('Offline'), nowOnline));
+          internetValue.replaceWith(internetValue = connectionBadge(current.status));
       });
-    }, 5);
+    }, 10);
 
     var warning = security.configured ? null : E('div', { class: 'alert-message warning' }, [
       E('strong', {}, _('Beveiliging afronden: ')),
@@ -134,10 +145,16 @@ return view.extend({
       E('a', { href: L.url('admin/rdzbridge/security') }, _('Nu instellen'))
     ]);
 
+    var portalWarning = connectivity.status === 'captive_portal' ? E('div', { class: 'alert-message warning' }, [
+      E('strong', {}, _('Wifi is verbonden, maar het netwerk vraagt om aanmelding. ')),
+      _('Automatisch herstel is gepauzeerd totdat de login is voltooid.')
+    ]) : null;
+
     return E([], [
       E('h2', {}, _('RDZ 5G Bridge')),
       E('p', {}, _('5G/wifi-internet wordt via NAT en DHCP doorgestuurd naar de Realtek Ethernet-uitgang.')),
       warning,
+      portalWarning,
       statusBox,
       actions
     ].filter(Boolean));

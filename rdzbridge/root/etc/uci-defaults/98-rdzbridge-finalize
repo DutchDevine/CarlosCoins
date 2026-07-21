@@ -1,21 +1,30 @@
 #!/bin/sh
 set -e
 
+uci set network.lan.proto='static'
 uci set network.lan.ipaddr='10.77.77.1'
 uci set network.lan.netmask='255.255.255.0'
+uci set dhcp.lan.interface='lan'
+uci set dhcp.lan.ignore='0'
 uci set dhcp.lan.start='100'
 uci set dhcp.lan.limit='150'
 uci set dhcp.lan.leasetime='12h'
 
 ETH=""
+FALLBACK=""
 for D in /sys/class/net/*; do
 	N="${D##*/}"
 	[ "$N" = lo ] && continue
 	[ -d "$D/wireless" ] && continue
 	[ -e "$D/device" ] || continue
-	ETH="$N"
-	break
+	[ -z "$FALLBACK" ] && FALLBACK="$N"
+	DRIVER="$(basename "$(readlink -f "$D/device/driver" 2>/dev/null)" 2>/dev/null)"
+	if [ "$DRIVER" = r8169 ]; then
+		ETH="$N"
+		break
+	fi
 done
+[ -n "$ETH" ] || ETH="$FALLBACK"
 
 if [ -n "$ETH" ]; then
 	uci -q delete network.br_lan
@@ -33,6 +42,10 @@ uci commit network
 uci commit dhcp
 uci commit uhttpd
 uci commit dropbear
+
 /etc/init.d/rdzbridge-watchdog enable
+/etc/init.d/rdzbridge-watchdog start 2>/dev/null || true
+/etc/init.d/network reload 2>/dev/null || true
+/etc/init.d/dnsmasq restart 2>/dev/null || true
 rm -f /tmp/luci-indexcache
 exit 0

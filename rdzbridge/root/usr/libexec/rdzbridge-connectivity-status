@@ -1,0 +1,43 @@
+#!/bin/sh
+CHECK_URL='http://connectivitycheck.gstatic.com/generate_204'
+PORTAL_URL='http://neverssl.com/'
+BODY='/tmp/rdzbridge-connectivity.body'
+rm -f "$BODY"
+
+WWAN="$(ubus call network.interface.wwan status 2>/dev/null || true)"
+UP="$(printf '%s' "$WWAN" | jsonfilter -e '@.up' 2>/dev/null)"
+IP="$(printf '%s' "$WWAN" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+
+if [ "$UP" != true ]; then
+	printf '{"status":"disconnected","portal_url":"%s"}\n' "$PORTAL_URL"
+	exit 0
+fi
+
+if [ -z "$IP" ]; then
+	printf '{"status":"no_address","portal_url":"%s"}\n' "$PORTAL_URL"
+	exit 0
+fi
+
+PING_OK=false
+DNS_OK=false
+HTTP_OK=false
+ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && PING_OK=true
+nslookup openwrt.org >/dev/null 2>&1 && DNS_OK=true
+
+if command -v uclient-fetch >/dev/null 2>&1; then
+	timeout 12 uclient-fetch -q -O "$BODY" "$CHECK_URL" >/dev/null 2>&1 && HTTP_OK=true
+elif command -v wget >/dev/null 2>&1; then
+	timeout 12 wget -q -O "$BODY" "$CHECK_URL" >/dev/null 2>&1 && HTTP_OK=true
+fi
+
+if [ -s "$BODY" ]; then
+	STATUS='captive_portal'
+elif [ "$HTTP_OK" = true ]; then
+	STATUS='online'
+elif [ "$PING_OK" = true ] || [ "$DNS_OK" = true ]; then
+	STATUS='limited'
+else
+	STATUS='no_internet'
+fi
+rm -f "$BODY"
+printf '{"status":"%s","ip":"%s","ping":%s,"dns":%s,"http":%s,"portal_url":"%s"}\n' "$STATUS" "$IP" "$PING_OK" "$DNS_OK" "$HTTP_OK" "$PORTAL_URL"

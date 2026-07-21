@@ -5,26 +5,39 @@ ENABLED="$(uci -q get rdzbridge.main.enabled || echo 1)"
 [ "$ENABLED" = 1 ] || { echo '{"enabled":false,"status":"disabled","failures":0,"last_action":"Uitgeschakeld"}' > "$STATE"; exit 0; }
 THRESHOLD="$(uci -q get rdzbridge.main.failure_threshold || echo 3)"
 RADIO_THRESHOLD="$(uci -q get rdzbridge.main.radio_restart_threshold || echo 6)"
-TEST_IP="$(uci -q get rdzbridge.main.test_ip || echo 1.1.1.1)"
 F="$(cat "$FAIL" 2>/dev/null || echo 0)"
-ACTION="Geen"
-if ubus call network.interface.wwan status 2>/dev/null | grep -q '"up": true' && ping -c 1 -W 2 "$TEST_IP" >/dev/null 2>&1; then
-	F=0
-	STATUS=online
-else
-	F=$((F + 1))
-	STATUS=offline
-	if [ "$F" -eq "$THRESHOLD" ]; then
-		ACTION='WWAN vernieuwd'
-		ifdown wwan 2>/dev/null || true
-		sleep 2
-		ifup wwan 2>/dev/null || true
-	elif [ "$F" -ge "$RADIO_THRESHOLD" ]; then
-		ACTION='Wifi-radio herstart'
-		wifi reload 2>/dev/null || true
+ACTION='Geen'
+CONNECTIVITY="$(/usr/libexec/rdzbridge-connectivity-status 2>/dev/null || echo '{"status":"unknown"}')"
+STATUS="$(printf '%s' "$CONNECTIVITY" | jsonfilter -e '@.status' 2>/dev/null)"
+PORTAL_URL="$(printf '%s' "$CONNECTIVITY" | jsonfilter -e '@.portal_url' 2>/dev/null)"
+
+case "$STATUS" in
+	online)
 		F=0
-	fi
-fi
+		;;
+	captive_portal)
+		F=0
+		ACTION='Login vereist; automatisch herstel gepauzeerd'
+		;;
+	limited)
+		F=0
+		ACTION='Beperkte toegang; automatisch herstel gepauzeerd'
+		;;
+	*)
+		F=$((F + 1))
+		if [ "$F" -eq "$THRESHOLD" ]; then
+			ACTION='WWAN vernieuwd'
+			ifdown wwan 2>/dev/null || true
+			sleep 2
+			ifup wwan 2>/dev/null || true
+		elif [ "$F" -ge "$RADIO_THRESHOLD" ]; then
+			ACTION='Wifi-radio herstart'
+			wifi reload 2>/dev/null || true
+			F=0
+		fi
+		;;
+esac
+
 echo "$F" > "$FAIL"
-printf '{"enabled":true,"status":"%s","failures":%s,"last_action":"%s","updated":%s}\n' "$STATUS" "$F" "$ACTION" "$(date +%s)" > "$STATE"
+printf '{"enabled":true,"status":"%s","failures":%s,"last_action":"%s","portal_url":"%s","updated":%s}\n' "$STATUS" "$F" "$ACTION" "$PORTAL_URL" "$(date +%s)" > "$STATE"
 logger -t rdzbridge "status=$STATUS failures=$F action=$ACTION"

@@ -1,6 +1,10 @@
 #!/bin/sh
-if grep -q '^root:[!*]:' /etc/shadow 2>/dev/null; then
-	echo '{"configured":false}'
-else
-	echo '{"configured":true}'
-fi
+HASH="$(awk -F: '$1 == "root" { print $2; exit }' /etc/shadow 2>/dev/null)"
+case "$HASH" in
+	''|'!'|'!!'|'*'|\!*|\**)
+		echo '{"configured":false}'
+		;;
+	*)
+		echo '{"configured":true}'
+		;;
+esac
