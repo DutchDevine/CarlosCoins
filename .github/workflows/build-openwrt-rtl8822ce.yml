@@ -11,8 +11,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
 
     env:
       OPENWRT_VERSION: '25.12.5'
@@ -21,31 +21,45 @@ jobs:
       PROFILE: 'generic'
 
     steps:
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl file gawk gettext git \
-            libncurses-dev python3 rsync unzip zstd
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Download OpenWrt ImageBuilder
+      - name: Install ImageBuilder dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl file gawk gettext git \
+            libncurses5-dev libncursesw5-dev libssl-dev python3 \
+            python3-distutils rsync unzip wget xsltproc zlib1g-dev zstd \
+            bzip2 dosfstools e2fsprogs mtools qemu-utils
+
+      - name: Download and verify OpenWrt ImageBuilder
         run: |
           set -euxo pipefail
           BASE_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET}/${SUBTARGET}"
           ARCHIVE="openwrt-imagebuilder-${OPENWRT_VERSION}-${TARGET}-${SUBTARGET}.Linux-x86_64.tar.zst"
-          curl --fail --location --retry 5 --retry-delay 5 -o "$ARCHIVE" "$BASE_URL/$ARCHIVE"
-          curl --fail --location --retry 5 --retry-delay 5 -o sha256sums "$BASE_URL/sha256sums"
-          grep " $ARCHIVE$" sha256sums | sha256sum -c -
-          tar --use-compress-program=unzstd -xf "$ARCHIVE"
-          mv "openwrt-imagebuilder-${OPENWRT_VERSION}-${TARGET}-${SUBTARGET}.Linux-x86_64" imagebuilder
 
-      - name: Add first-boot defaults
+          curl --fail --location --retry 5 --retry-delay 5 \
+            --output "$ARCHIVE" "$BASE_URL/$ARCHIVE"
+          curl --fail --location --retry 5 --retry-delay 5 \
+            --output sha256sums "$BASE_URL/sha256sums"
+
+          EXPECTED="$(awk -v file="$ARCHIVE" '$2 == file {print $1}' sha256sums)"
+          test -n "$EXPECTED"
+          echo "$EXPECTED  $ARCHIVE" | sha256sum --check --strict -
+
+          tar --zstd -xf "$ARCHIVE"
+          BUILDER_DIR="$(find . -maxdepth 1 -type d -name 'openwrt-imagebuilder-*' -print -quit)"
+          test -n "$BUILDER_DIR"
+          mv "$BUILDER_DIR" imagebuilder
+
+      - name: Add first-boot router defaults
         run: |
           set -euxo pipefail
           mkdir -p files/etc/uci-defaults
           cat > files/etc/uci-defaults/99-rdz-router-defaults <<'EOF'
           #!/bin/sh
-          # Keep the wired interface as LAN and avoid common hotspot subnet conflicts.
           uci set network.lan.ipaddr='10.77.77.1'
           uci set network.lan.netmask='255.255.255.0'
           uci set dhcp.lan.start='100'
@@ -57,51 +71,66 @@ jobs:
           EOF
           chmod 0755 files/etc/uci-defaults/99-rdz-router-defaults
 
+      - name: Show available OpenWrt profiles
+        working-directory: imagebuilder
+        run: |
+          set -euxo pipefail
+          make info
+
       - name: Build customized EFI and BIOS images
         working-directory: imagebuilder
         run: |
           set -euxo pipefail
-          PACKAGES="luci luci-ssl ca-bundle kmod-rtw88-8822ce rtl8822ce-firmware iw iwinfo pciutils ethtool"
+          PACKAGES="luci luci-ssl ca-bundle \
+          kmod-rtw88 kmod-rtw88-pci kmod-rtw88-8822c kmod-rtw88-8822ce \
+          rtl8822ce-firmware wireless-regdb wpad-basic-mbedtls \
+          iw iwinfo pciutils ethtool"
+
           make image \
             PROFILE="$PROFILE" \
             PACKAGES="$PACKAGES" \
             FILES="$GITHUB_WORKSPACE/files" \
             ROOTFS_PARTSIZE=512
 
-      - name: Collect boot images and checksums
+      - name: Verify and collect images
         run: |
           set -euxo pipefail
+          OUTPUT_DIR="imagebuilder/bin/targets/${TARGET}/${SUBTARGET}"
+          test -d "$OUTPUT_DIR"
+          ls -lah "$OUTPUT_DIR"
+
           mkdir -p artifact
-          find imagebuilder/bin/targets/x86/64 -maxdepth 1 -type f \
+          find "$OUTPUT_DIR" -maxdepth 1 -type f \
             \( -name '*generic-ext4-combined-efi.img.gz' \
             -o -name '*generic-ext4-combined.img.gz' \
-            -o -name '*generic-ext4-combined-efi.img' \
-            -o -name '*generic-ext4-combined.img' \
-            -o -name 'sha256sums' \
             -o -name '*manifest' \) \
-            -exec cp {} artifact/ \;
+            -exec cp -v {} artifact/ \;
+
+          test -n "$(find artifact -maxdepth 1 -name '*generic-ext4-combined-efi.img.gz' -print -quit)"
+          test -n "$(find artifact -maxdepth 1 -name '*generic-ext4-combined.img.gz' -print -quit)"
+
           cd artifact
-          sha256sum *.img* > RDZ-SHA256SUMS.txt
+          sha256sum *.img.gz > RDZ-SHA256SUMS.txt
           cat > README-FIRST.txt <<'EOF'
-          RENZODEZWART.PL - OpenWrt x86/64 RTL8822CE build
+          RENZODEZWART.PL - OpenWrt x86/64 RTL8822CE
 
-          Gebruik bij moderne UEFI-systemen:
-          *generic-ext4-combined-efi.img.gz
+          Moderne UEFI-computer:
+          gebruik *generic-ext4-combined-efi.img.gz
 
-          Gebruik bij oude legacy-BIOS-systemen:
-          *generic-ext4-combined.img.gz
+          Alleen voor legacy BIOS:
+          gebruik *generic-ext4-combined.img.gz
 
-          Schrijf de .img.gz rechtstreeks naar een USB-stick met Rufus of balenaEtcher.
-          Secure Boot moet doorgaans uitgeschakeld zijn.
+          Schrijf het .img.gz-bestand rechtstreeks naar een USB-stick met
+          balenaEtcher of Rufus. Secure Boot moet uitgeschakeld zijn.
 
-          Eerste LAN-adres:
-          http://10.77.77.1
+          Eerste LAN-adres: http://10.77.77.1
 
-          De RTL8822CE-driver en firmware zijn vooraf ingebouwd.
-          Verbind in LuCI via Network > Wireless > Scan met de telefoonhotspot.
-          Maak daarbij een nieuw netwerk 'wwan', protocol DHCP client, firewallzone wan.
+          De Realtek RTL8822CE-driver, firmware en WPA-clientsoftware zijn
+          vooraf ingebouwd. Verbind daarna in LuCI via:
+          Network > Wireless > Scan > Join Network
+
+          Maak daarbij netwerk 'wwan', protocol DHCP client, firewallzone wan.
           EOF
-          ls -lah
 
       - name: Upload OpenWrt USB images
         uses: actions/upload-artifact@v4
