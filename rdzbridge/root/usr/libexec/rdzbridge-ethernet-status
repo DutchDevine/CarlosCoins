@@ -1,0 +1,20 @@
+#!/bin/sh
+DEV=""
+for D in /sys/class/net/*; do
+	N="${D##*/}"
+	[ "$N" = "lo" ] && continue
+	[ -d "$D/wireless" ] && continue
+	[ -e "$D/device" ] || continue
+	DEV="$N"
+	break
+done
+if [ -z "$DEV" ]; then
+	echo '{"present":false}'
+	exit 0
+fi
+DRIVER="$(basename "$(readlink -f /sys/class/net/$DEV/device/driver 2>/dev/null)" 2>/dev/null)"
+CARRIER="$(cat /sys/class/net/$DEV/carrier 2>/dev/null || echo 0)"
+SPEED="$(cat /sys/class/net/$DEV/speed 2>/dev/null || true)"
+RX="$(cat /sys/class/net/$DEV/statistics/rx_bytes 2>/dev/null || echo 0)"
+TX="$(cat /sys/class/net/$DEV/statistics/tx_bytes 2>/dev/null || echo 0)"
+printf '{"present":true,"device":"%s","driver":"%s","carrier":%s,"speed":"%s","rx_bytes":%s,"tx_bytes":%s}\n' "$DEV" "$DRIVER" "$CARRIER" "$SPEED" "$RX" "$TX"

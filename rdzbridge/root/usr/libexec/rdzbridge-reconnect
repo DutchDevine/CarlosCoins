@@ -1,0 +1,8 @@
+#!/bin/sh
+logger -t rdzbridge 'Handmatige WWAN-herverbinding'
+ifdown wwan 2>/dev/null || true
+sleep 2
+wifi reload 2>/dev/null || true
+sleep 2
+ifup wwan 2>/dev/null || true
+exit 0

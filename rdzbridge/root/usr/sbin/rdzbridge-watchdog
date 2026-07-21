@@ -1,0 +1,30 @@
+#!/bin/sh
+STATE=/tmp/rdzbridge-watchdog.json
+FAIL=/tmp/rdzbridge-watchdog.failures
+ENABLED="$(uci -q get rdzbridge.main.enabled || echo 1)"
+[ "$ENABLED" = 1 ] || { echo '{"enabled":false,"status":"disabled","failures":0,"last_action":"Uitgeschakeld"}' > "$STATE"; exit 0; }
+THRESHOLD="$(uci -q get rdzbridge.main.failure_threshold || echo 3)"
+RADIO_THRESHOLD="$(uci -q get rdzbridge.main.radio_restart_threshold || echo 6)"
+TEST_IP="$(uci -q get rdzbridge.main.test_ip || echo 1.1.1.1)"
+F="$(cat "$FAIL" 2>/dev/null || echo 0)"
+ACTION="Geen"
+if ubus call network.interface.wwan status 2>/dev/null | grep -q '"up": true' && ping -c 1 -W 2 "$TEST_IP" >/dev/null 2>&1; then
+	F=0
+	STATUS=online
+else
+	F=$((F + 1))
+	STATUS=offline
+	if [ "$F" -eq "$THRESHOLD" ]; then
+		ACTION='WWAN vernieuwd'
+		ifdown wwan 2>/dev/null || true
+		sleep 2
+		ifup wwan 2>/dev/null || true
+	elif [ "$F" -ge "$RADIO_THRESHOLD" ]; then
+		ACTION='Wifi-radio herstart'
+		wifi reload 2>/dev/null || true
+		F=0
+	fi
+fi
+echo "$F" > "$FAIL"
+printf '{"enabled":true,"status":"%s","failures":%s,"last_action":"%s","updated":%s}\n' "$STATUS" "$F" "$ACTION" "$(date +%s)" > "$STATE"
+logger -t rdzbridge "status=$STATUS failures=$F action=$ACTION"

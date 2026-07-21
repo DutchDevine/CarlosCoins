@@ -1,0 +1,9 @@
+#!/bin/sh
+FILE=/tmp/rdzbridge-watchdog.json
+if [ -s "$FILE" ]; then
+	cat "$FILE"
+else
+	ENABLED="$(uci -q get rdzbridge.main.enabled || echo 1)"
+	[ "$ENABLED" = 1 ] && E=true || E=false
+	printf '{"enabled":%s,"status":"unknown","failures":0,"last_action":"Geen"}\n' "$E"
+fi

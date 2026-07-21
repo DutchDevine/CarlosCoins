@@ -1,20 +1,34 @@
 {
   "luci-app-rdzbridge": {
-    "description": "Grant access to the RDZ 5G Bridge dashboard",
+    "description": "RDZ 5G Bridge beheer",
     "read": {
       "ubus": {
         "network.interface": [ "dump", "status" ],
         "network.device": [ "status" ],
         "iwinfo": [ "info", "assoclist", "scan" ],
-        "system": [ "board", "info" ]
+        "system": [ "board", "info" ],
+        "file": [ "exec", "stat" ]
       },
-      "uci": [ "network", "wireless", "firewall", "dhcp" ]
+      "uci": [ "network", "wireless", "firewall", "dhcp", "rdzbridge", "uhttpd", "dropbear" ],
+      "file": {
+        "/usr/libexec/rdzbridge-*": [ "exec" ],
+        "/bin/ping": [ "exec" ],
+        "/usr/bin/nslookup": [ "exec" ],
+        "/sbin/ifup": [ "exec" ]
+      }
     },
     "write": {
       "ubus": {
-        "network.interface": [ "up", "down", "renew" ]
+        "network.interface": [ "up", "down", "renew" ],
+        "iwinfo": [ "scan" ],
+        "file": [ "exec" ]
       },
-      "uci": [ "network", "wireless", "firewall" ]
+      "uci": [ "network", "wireless", "firewall", "dhcp", "rdzbridge" ],
+      "file": {
+        "/usr/libexec/rdzbridge-reconnect": [ "exec" ],
+        "/sbin/ifup": [ "exec" ],
+        "/sbin/wifi": [ "exec" ]
+      }
     }
   }
 }

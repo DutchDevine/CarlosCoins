@@ -1,0 +1,38 @@
+#!/bin/sh
+set -e
+
+uci set network.lan.ipaddr='10.77.77.1'
+uci set network.lan.netmask='255.255.255.0'
+uci set dhcp.lan.start='100'
+uci set dhcp.lan.limit='150'
+uci set dhcp.lan.leasetime='12h'
+
+ETH=""
+for D in /sys/class/net/*; do
+	N="${D##*/}"
+	[ "$N" = lo ] && continue
+	[ -d "$D/wireless" ] && continue
+	[ -e "$D/device" ] || continue
+	ETH="$N"
+	break
+done
+
+if [ -n "$ETH" ]; then
+	uci -q delete network.br_lan
+	uci set network.br_lan='device'
+	uci set network.br_lan.name='br-lan'
+	uci set network.br_lan.type='bridge'
+	uci add_list network.br_lan.ports="$ETH"
+	uci set network.lan.device='br-lan'
+fi
+
+uci set uhttpd.main.index_page='/cgi-bin/luci/admin/rdzbridge/overview'
+uci set dropbear.@dropbear[0].Interface='lan'
+uci set dropbear.@dropbear[0].PasswordAuth='on'
+uci commit network
+uci commit dhcp
+uci commit uhttpd
+uci commit dropbear
+/etc/init.d/rdzbridge-watchdog enable
+rm -f /tmp/luci-indexcache
+exit 0

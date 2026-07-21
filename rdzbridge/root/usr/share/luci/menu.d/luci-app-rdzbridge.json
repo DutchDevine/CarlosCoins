@@ -2,36 +2,27 @@
   "admin/rdzbridge": {
     "title": "RDZ 5G Bridge",
     "order": 1,
-    "action": {
-      "type": "firstchild",
-      "recurse": true
-    },
-    "depends": {
-      "acl": [ "luci-app-rdzbridge" ]
-    }
+    "action": { "type": "firstchild", "recurse": true },
+    "depends": { "acl": [ "luci-app-rdzbridge" ] }
   },
   "admin/rdzbridge/overview": {
     "title": "Overzicht",
     "order": 1,
-    "action": {
-      "type": "view",
-      "path": "rdzbridge/overview"
-    }
+    "action": { "type": "view", "path": "rdzbridge/overview" }
   },
   "admin/rdzbridge/setup": {
     "title": "Wifi instellen",
     "order": 2,
-    "action": {
-      "type": "view",
-      "path": "rdzbridge/setup"
-    }
+    "action": { "type": "view", "path": "rdzbridge/setup" }
   },
   "admin/rdzbridge/diagnostics": {
     "title": "Diagnose",
     "order": 3,
-    "action": {
-      "type": "view",
-      "path": "rdzbridge/diagnostics"
-    }
+    "action": { "type": "view", "path": "rdzbridge/diagnostics" }
+  },
+  "admin/rdzbridge/security": {
+    "title": "Beveiliging",
+    "order": 4,
+    "action": { "type": "view", "path": "rdzbridge/security" }
   }
 }

@@ -1,0 +1,6 @@
+#!/bin/sh
+if grep -q '^root:[!*]:' /etc/shadow 2>/dev/null; then
+	echo '{"configured":false}'
+else
+	echo '{"configured":true}'
+fi
