@@ -75,13 +75,15 @@ jobs:
                 "rtl8822ce-firmware",
                 "wireless-regdb",
                 "wpad-basic-mbedtls",
+                "kmod-r8169",
+                "r8169-firmware",
                 "iw",
                 "iwinfo",
                 "pciutils",
                 "ethtool"
               ],
               defaults: $defaults,
-              client: "github-actions-rdz/2.0",
+              client: "github-actions-rdz/2.1",
               rootfs_size_mb: 512,
               filesystem: "ext4",
               diff_packages: true
@@ -181,6 +183,10 @@ jobs:
           cat > README-FIRST.txt <<'EOF'
           RENZODEZWART.PL - OpenWrt x86/64 RTL8822CE met RDZ 5G Bridge GUI
 
+          Ondersteunde netwerkhardware in deze build:
+          - Realtek RTL8822CE wifi, PCI ID 10EC:C822
+          - Realtek RTL8111/RTL8168 Ethernet, PCI ID 10EC:8168
+
           Moderne UEFI-computer:
           gebruik het bestand met generic-ext4-combined-efi in de naam.
 
@@ -208,7 +214,7 @@ jobs:
       - name: Upload OpenWrt USB images
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt-25.12.5-x86-RTL8822CE-RDZ-GUI
+          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI
           path: artifact/
           if-no-files-found: error
           retention-days: 30
