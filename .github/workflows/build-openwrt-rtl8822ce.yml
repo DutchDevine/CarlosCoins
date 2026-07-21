@@ -1,0 +1,112 @@
+name: Build OpenWrt x86 RTL8822CE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-openwrt-rtl8822ce.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      OPENWRT_VERSION: '25.12.5'
+      TARGET: 'x86'
+      SUBTARGET: '64'
+      PROFILE: 'generic'
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl file gawk gettext git \
+            libncurses-dev python3 rsync unzip zstd
+
+      - name: Download OpenWrt ImageBuilder
+        run: |
+          set -euxo pipefail
+          BASE_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET}/${SUBTARGET}"
+          ARCHIVE="openwrt-imagebuilder-${OPENWRT_VERSION}-${TARGET}-${SUBTARGET}.Linux-x86_64.tar.zst"
+          curl --fail --location --retry 5 --retry-delay 5 -o "$ARCHIVE" "$BASE_URL/$ARCHIVE"
+          curl --fail --location --retry 5 --retry-delay 5 -o sha256sums "$BASE_URL/sha256sums"
+          grep " $ARCHIVE$" sha256sums | sha256sum -c -
+          tar --use-compress-program=unzstd -xf "$ARCHIVE"
+          mv "openwrt-imagebuilder-${OPENWRT_VERSION}-${TARGET}-${SUBTARGET}.Linux-x86_64" imagebuilder
+
+      - name: Add first-boot defaults
+        run: |
+          set -euxo pipefail
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-rdz-router-defaults <<'EOF'
+          #!/bin/sh
+          # Keep the wired interface as LAN and avoid common hotspot subnet conflicts.
+          uci set network.lan.ipaddr='10.77.77.1'
+          uci set network.lan.netmask='255.255.255.0'
+          uci set dhcp.lan.start='100'
+          uci set dhcp.lan.limit='150'
+          uci set dhcp.lan.leasetime='12h'
+          uci commit network
+          uci commit dhcp
+          exit 0
+          EOF
+          chmod 0755 files/etc/uci-defaults/99-rdz-router-defaults
+
+      - name: Build customized EFI and BIOS images
+        working-directory: imagebuilder
+        run: |
+          set -euxo pipefail
+          PACKAGES="luci luci-ssl ca-bundle kmod-rtw88-8822ce rtl8822ce-firmware iw iwinfo pciutils ethtool"
+          make image \
+            PROFILE="$PROFILE" \
+            PACKAGES="$PACKAGES" \
+            FILES="$GITHUB_WORKSPACE/files" \
+            ROOTFS_PARTSIZE=512
+
+      - name: Collect boot images and checksums
+        run: |
+          set -euxo pipefail
+          mkdir -p artifact
+          find imagebuilder/bin/targets/x86/64 -maxdepth 1 -type f \
+            \( -name '*generic-ext4-combined-efi.img.gz' \
+            -o -name '*generic-ext4-combined.img.gz' \
+            -o -name '*generic-ext4-combined-efi.img' \
+            -o -name '*generic-ext4-combined.img' \
+            -o -name 'sha256sums' \
+            -o -name '*manifest' \) \
+            -exec cp {} artifact/ \;
+          cd artifact
+          sha256sum *.img* > RDZ-SHA256SUMS.txt
+          cat > README-FIRST.txt <<'EOF'
+          RENZODEZWART.PL - OpenWrt x86/64 RTL8822CE build
+
+          Gebruik bij moderne UEFI-systemen:
+          *generic-ext4-combined-efi.img.gz
+
+          Gebruik bij oude legacy-BIOS-systemen:
+          *generic-ext4-combined.img.gz
+
+          Schrijf de .img.gz rechtstreeks naar een USB-stick met Rufus of balenaEtcher.
+          Secure Boot moet doorgaans uitgeschakeld zijn.
+
+          Eerste LAN-adres:
+          http://10.77.77.1
+
+          De RTL8822CE-driver en firmware zijn vooraf ingebouwd.
+          Verbind in LuCI via Network > Wireless > Scan met de telefoonhotspot.
+          Maak daarbij een nieuw netwerk 'wwan', protocol DHCP client, firewallzone wan.
+          EOF
+          ls -lah
+
+      - name: Upload OpenWrt USB images
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt-25.12.5-x86-RTL8822CE-RDZ
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
