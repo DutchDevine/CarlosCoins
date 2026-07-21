@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - '.github/workflows/build-openwrt-rtl8822ce.yml'
+      - 'rdzbridge/**'
 
 permissions:
   contents: read
@@ -19,22 +20,45 @@ jobs:
       ASU_URL: 'https://sysupgrade.openwrt.org'
 
     steps:
+      - name: Checkout GUI source
+        uses: actions/checkout@v4
+
       - name: Request customized image from official OpenWrt builder
         shell: bash
         run: |
           set -Eeuo pipefail
 
+          test -d rdzbridge/root
+          tar -C rdzbridge/root -czf rdzbridge-root.tar.gz .
+          PAYLOAD="$(base64 -w 0 rdzbridge-root.tar.gz)"
+
           cat > defaults.sh <<'EOF'
           #!/bin/sh
+          set -e
+
           uci set network.lan.ipaddr='10.77.77.1'
           uci set network.lan.netmask='255.255.255.0'
           uci set dhcp.lan.start='100'
           uci set dhcp.lan.limit='150'
           uci set dhcp.lan.leasetime='12h'
+          uci set uhttpd.main.index_page='/cgi-bin/luci/admin/rdzbridge/overview'
           uci commit network
           uci commit dhcp
+          uci commit uhttpd
+
+          cat > /tmp/rdzbridge-root.tar.gz.b64 <<'PAYLOAD_EOF'
+          __RDZ_PAYLOAD__
+          PAYLOAD_EOF
+
+          base64 -d /tmp/rdzbridge-root.tar.gz.b64 > /tmp/rdzbridge-root.tar.gz
+          tar -xzf /tmp/rdzbridge-root.tar.gz -C /
+          rm -f /tmp/rdzbridge-root.tar.gz /tmp/rdzbridge-root.tar.gz.b64
+
+          rm -f /tmp/luci-indexcache
           exit 0
           EOF
+
+          sed -i "s|__RDZ_PAYLOAD__|$PAYLOAD|" defaults.sh
 
           jq -n \
             --arg version "$OPENWRT_VERSION" \
@@ -57,7 +81,7 @@ jobs:
                 "ethtool"
               ],
               defaults: $defaults,
-              client: "github-actions-rdz/1.0",
+              client: "github-actions-rdz/2.0",
               rootfs_size_mb: 512,
               filesystem: "ext4",
               diff_packages: true
@@ -155,29 +179,28 @@ jobs:
           sha256sum *.img.gz > RDZ-SHA256SUMS.txt
 
           cat > README-FIRST.txt <<'EOF'
-          RENZODEZWART.PL - OpenWrt x86/64 RTL8822CE
+          RENZODEZWART.PL - OpenWrt x86/64 RTL8822CE met RDZ 5G Bridge GUI
 
-          Gebruik op een moderne UEFI-computer het bestand met:
-          generic-ext4-combined-efi...img.gz
+          Moderne UEFI-computer:
+          gebruik het bestand met generic-ext4-combined-efi in de naam.
 
-          Gebruik het bestand zonder '-efi' alleen voor legacy BIOS.
+          Legacy BIOS:
+          gebruik het bestand zonder '-efi'.
 
           Schrijf het .img.gz-bestand rechtstreeks naar een USB-stick met
           balenaEtcher of Rufus. Secure Boot moet normaal uitgeschakeld zijn.
 
-          Eerste lokale beheeradres:
+          Open na het opstarten:
           http://10.77.77.1
 
-          De Realtek RTL8822CE-driver, firmware, LuCI en WPA-clientsoftware
-          zijn vooraf ingebouwd.
+          Het adres opent direct de RDZ 5G Bridge-interface. De normale LuCI-
+          functies blijven bereikbaar via de knoppen voor geavanceerd beheer.
 
-          Verbind na het opstarten in LuCI via:
-          Network > Wireless > Scan > Join Network
-
-          Instellingen:
-          netwerknaam: wwan
-          protocol: DHCP client
-          firewallzone: wan
+          Eerste configuratie:
+          1. Open Wifi instellen.
+          2. Scan met de Realtek-radio.
+          3. Selecteer de 5 GHz-hotspot van de telefoon.
+          4. Gebruik netwerknaam wwan, DHCP-client en firewallzone wan.
           EOF
 
           ls -lah
@@ -185,7 +208,7 @@ jobs:
       - name: Upload OpenWrt USB images
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt-25.12.5-x86-RTL8822CE-RDZ
+          name: OpenWrt-25.12.5-x86-RTL8822CE-RDZ-GUI
           path: artifact/
           if-no-files-found: error
           retention-days: 30
