@@ -1,0 +1,20 @@
+{
+  "luci-app-rdzbridge": {
+    "description": "Grant access to the RDZ 5G Bridge dashboard",
+    "read": {
+      "ubus": {
+        "network.interface": [ "dump", "status" ],
+        "network.device": [ "status" ],
+        "iwinfo": [ "info", "assoclist", "scan" ],
+        "system": [ "board", "info" ]
+      },
+      "uci": [ "network", "wireless", "firewall", "dhcp" ]
+    },
+    "write": {
+      "ubus": {
+        "network.interface": [ "up", "down", "renew" ]
+      },
+      "uci": [ "network", "wireless", "firewall" ]
+    }
+  }
+}
