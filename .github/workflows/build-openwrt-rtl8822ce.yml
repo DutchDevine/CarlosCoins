@@ -21,7 +21,7 @@ jobs:
 
     steps:
       - name: Checkout GUI source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate RDZ source tree
         shell: bash
@@ -105,7 +105,7 @@ jobs:
                 "ethtool"
               ],
               defaults: $defaults,
-              client: "github-actions-rdz/3.0",
+              client: "github-actions-rdz/3.1",
               rootfs_size_mb: 512,
               filesystem: "ext4",
               diff_packages: true
@@ -220,8 +220,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86
 
-          LEGACY_IMAGE="$(find artifact -maxdepth 1 -type f -name '*generic-ext4-combined.img.gz' | head -n 1)"
-          test -n "$LEGACY_IMAGE"
+          LEGACY_IMAGE="$(find artifact -maxdepth 1 -type f -name '*generic-ext4-combined*.img.gz' ! -name '*combined-efi*' | head -n 1)"
+          if [[ -z "$LEGACY_IMAGE" ]]; then
+            echo 'Geen legacy combined EXT4-image gevonden. Beschikbare bestanden:' >&2
+            find artifact -maxdepth 1 -type f -printf '%f\n' >&2
+            exit 1
+          fi
+          echo "QEMU test image: $LEGACY_IMAGE"
           gzip -dc "$LEGACY_IMAGE" > openwrt-rdz-smoke.img
 
           set +e
@@ -234,6 +239,11 @@ jobs:
           set -e
           echo "QEMU exit code: $QEMU_RC"
           tail -n 100 artifact/QEMU-BOOT.log || true
+
+          grep -Eq 'Please press Enter to activate this console|procd: - init complete -|urngd: v' artifact/QEMU-BOOT.log || {
+            echo 'OpenWrt bereikte geen herkenbare first-bootstatus.' >&2
+            exit 1
+          }
 
           sudo mkdir -p /mnt/rdz-smoke
           LOOP="$(sudo losetup --find --show --partscan openwrt-rdz-smoke.img)"
@@ -256,7 +266,7 @@ jobs:
           test -s /mnt/rdz-smoke/etc/config/rdzbridge
           test ! -e /mnt/rdz-smoke/etc/uci-defaults/98-rdzbridge-finalize
           grep -q '10.77.77.1' /mnt/rdz-smoke/etc/config/network
-          grep -q 'rdzbridge-watchdog' /mnt/rdz-smoke/etc/rc.d/*rdzbridge-watchdog
+          find /mnt/rdz-smoke/etc/rc.d -maxdepth 1 -type l -name '*rdzbridge-watchdog' | grep -q .
 
           echo 'QEMU first-boot and embedded RDZ files validated.'
 
