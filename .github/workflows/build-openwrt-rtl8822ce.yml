@@ -11,54 +11,20 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
 
     env:
       OPENWRT_VERSION: '25.12.5'
-      TARGET: 'x86'
-      SUBTARGET: '64'
-      PROFILE: 'generic'
+      ASU_URL: 'https://sysupgrade.openwrt.org'
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install ImageBuilder dependencies
+      - name: Request customized image from official OpenWrt builder
+        shell: bash
         run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl file gawk gettext git \
-            libncurses5-dev libncursesw5-dev libssl-dev python3 \
-            python3-distutils rsync unzip wget xsltproc zlib1g-dev zstd \
-            bzip2 dosfstools e2fsprogs mtools qemu-utils
+          set -Eeuo pipefail
 
-      - name: Download and verify OpenWrt ImageBuilder
-        run: |
-          set -euxo pipefail
-          BASE_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET}/${SUBTARGET}"
-          ARCHIVE="openwrt-imagebuilder-${OPENWRT_VERSION}-${TARGET}-${SUBTARGET}.Linux-x86_64.tar.zst"
-
-          curl --fail --location --retry 5 --retry-delay 5 \
-            --output "$ARCHIVE" "$BASE_URL/$ARCHIVE"
-          curl --fail --location --retry 5 --retry-delay 5 \
-            --output sha256sums "$BASE_URL/sha256sums"
-
-          EXPECTED="$(awk -v file="$ARCHIVE" '$2 == file {print $1}' sha256sums)"
-          test -n "$EXPECTED"
-          echo "$EXPECTED  $ARCHIVE" | sha256sum --check --strict -
-
-          tar --zstd -xf "$ARCHIVE"
-          BUILDER_DIR="$(find . -maxdepth 1 -type d -name 'openwrt-imagebuilder-*' -print -quit)"
-          test -n "$BUILDER_DIR"
-          mv "$BUILDER_DIR" imagebuilder
-
-      - name: Add first-boot router defaults
-        run: |
-          set -euxo pipefail
-          mkdir -p files/etc/uci-defaults
-          cat > files/etc/uci-defaults/99-rdz-router-defaults <<'EOF'
+          cat > defaults.sh <<'EOF'
           #!/bin/sh
           uci set network.lan.ipaddr='10.77.77.1'
           uci set network.lan.netmask='255.255.255.0'
@@ -69,68 +35,152 @@ jobs:
           uci commit dhcp
           exit 0
           EOF
-          chmod 0755 files/etc/uci-defaults/99-rdz-router-defaults
 
-      - name: Show available OpenWrt profiles
-        working-directory: imagebuilder
+          jq -n \
+            --arg version "$OPENWRT_VERSION" \
+            --arg defaults "$(cat defaults.sh)" \
+            '{
+              version: $version,
+              target: "x86/64",
+              profile: "generic",
+              packages: [
+                "luci",
+                "luci-ssl",
+                "ca-bundle",
+                "kmod-rtw88-8822ce",
+                "rtl8822ce-firmware",
+                "wireless-regdb",
+                "wpad-basic-mbedtls",
+                "iw",
+                "iwinfo",
+                "pciutils",
+                "ethtool"
+              ],
+              defaults: $defaults,
+              client: "github-actions-rdz/1.0",
+              rootfs_size_mb: 512,
+              filesystem: "ext4",
+              diff_packages: true
+            }' > request.json
+
+          echo 'OpenWrt build request:'
+          jq '{version,target,profile,packages,rootfs_size_mb,filesystem,diff_packages}' request.json
+
+          HTTP_CODE="$(curl -4 --silent --show-error --location \
+            --connect-timeout 30 --max-time 120 \
+            --output response.json --write-out '%{http_code}' \
+            --header 'Content-Type: application/json' \
+            --request POST \
+            --data @request.json \
+            "$ASU_URL/api/v1/build")"
+
+          echo "Initial HTTP status: $HTTP_CODE"
+          cat response.json | jq . || cat response.json
+
+          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "202" ]]; then
+            echo 'The OpenWrt build server rejected the request.' >&2
+            exit 1
+          fi
+
+          REQUEST_HASH="$(jq -r '.request_hash // empty' response.json)"
+          if [[ -z "$REQUEST_HASH" ]]; then
+            echo 'No request_hash returned by the OpenWrt build server.' >&2
+            exit 1
+          fi
+
+          echo "Request hash: $REQUEST_HASH"
+
+          for attempt in $(seq 1 180); do
+            HTTP_CODE="$(curl -4 --silent --show-error --location \
+              --connect-timeout 30 --max-time 120 \
+              --output response.json --write-out '%{http_code}' \
+              "$ASU_URL/api/v1/build/$REQUEST_HASH")"
+
+            STATUS="$(jq -r '.imagebuilder_status // .detail // "unknown"' response.json 2>/dev/null || echo unknown)"
+            echo "Poll $attempt: HTTP $HTTP_CODE, status $STATUS"
+
+            if [[ "$HTTP_CODE" == "200" && "$STATUS" == "done" ]]; then
+              break
+            fi
+
+            if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "202" ]]; then
+              cat response.json | jq . || cat response.json
+              exit 1
+            fi
+
+            if [[ "$attempt" == "180" ]]; then
+              echo 'Timed out waiting for the OpenWrt image build.' >&2
+              cat response.json | jq . || cat response.json
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          jq . response.json
+          cp response.json build-response.json
+
+      - name: Download generated USB boot images
+        shell: bash
         run: |
-          set -euxo pipefail
-          make info
-
-      - name: Build customized EFI and BIOS images
-        working-directory: imagebuilder
-        run: |
-          set -euxo pipefail
-          PACKAGES="luci luci-ssl ca-bundle \
-          kmod-rtw88 kmod-rtw88-pci kmod-rtw88-8822c kmod-rtw88-8822ce \
-          rtl8822ce-firmware wireless-regdb wpad-basic-mbedtls \
-          iw iwinfo pciutils ethtool"
-
-          make image \
-            PROFILE="$PROFILE" \
-            PACKAGES="$PACKAGES" \
-            FILES="$GITHUB_WORKSPACE/files" \
-            ROOTFS_PARTSIZE=512
-
-      - name: Verify and collect images
-        run: |
-          set -euxo pipefail
-          OUTPUT_DIR="imagebuilder/bin/targets/${TARGET}/${SUBTARGET}"
-          test -d "$OUTPUT_DIR"
-          ls -lah "$OUTPUT_DIR"
+          set -Eeuo pipefail
 
           mkdir -p artifact
-          find "$OUTPUT_DIR" -maxdepth 1 -type f \
-            \( -name '*generic-ext4-combined-efi.img.gz' \
-            -o -name '*generic-ext4-combined.img.gz' \
-            -o -name '*manifest' \) \
-            -exec cp -v {} artifact/ \;
+          BIN_DIR="$(jq -r '.bin_dir // empty' build-response.json)"
+          if [[ -z "$BIN_DIR" ]]; then
+            echo 'The completed response does not contain bin_dir.' >&2
+            exit 1
+          fi
 
-          test -n "$(find artifact -maxdepth 1 -name '*generic-ext4-combined-efi.img.gz' -print -quit)"
-          test -n "$(find artifact -maxdepth 1 -name '*generic-ext4-combined.img.gz' -print -quit)"
+          mapfile -t IMAGES < <(
+            jq -r '.images[]?.name // empty' build-response.json |
+            grep -E 'generic-ext4-combined(-efi)?[^/]*\.img\.gz$' || true
+          )
 
+          if [[ "${#IMAGES[@]}" -eq 0 ]]; then
+            echo 'No combined EXT4 x86 USB images were returned.' >&2
+            jq '.images' build-response.json
+            exit 1
+          fi
+
+          for IMAGE in "${IMAGES[@]}"; do
+            echo "Downloading $IMAGE"
+            curl -4 --fail --show-error --location --retry 5 --retry-delay 5 \
+              --output "artifact/$IMAGE" \
+              "$ASU_URL/store/$BIN_DIR/$IMAGE"
+          done
+
+          cp build-response.json artifact/
           cd artifact
           sha256sum *.img.gz > RDZ-SHA256SUMS.txt
+
           cat > README-FIRST.txt <<'EOF'
           RENZODEZWART.PL - OpenWrt x86/64 RTL8822CE
 
-          Moderne UEFI-computer:
-          gebruik *generic-ext4-combined-efi.img.gz
+          Gebruik op een moderne UEFI-computer het bestand met:
+          generic-ext4-combined-efi...img.gz
 
-          Alleen voor legacy BIOS:
-          gebruik *generic-ext4-combined.img.gz
+          Gebruik het bestand zonder '-efi' alleen voor legacy BIOS.
 
           Schrijf het .img.gz-bestand rechtstreeks naar een USB-stick met
-          balenaEtcher of Rufus. Secure Boot moet uitgeschakeld zijn.
+          balenaEtcher of Rufus. Secure Boot moet normaal uitgeschakeld zijn.
 
-          Eerste LAN-adres: http://10.77.77.1
+          Eerste lokale beheeradres:
+          http://10.77.77.1
 
-          De Realtek RTL8822CE-driver, firmware en WPA-clientsoftware zijn
-          vooraf ingebouwd. Verbind daarna in LuCI via:
+          De Realtek RTL8822CE-driver, firmware, LuCI en WPA-clientsoftware
+          zijn vooraf ingebouwd.
+
+          Verbind na het opstarten in LuCI via:
           Network > Wireless > Scan > Join Network
 
-          Maak daarbij netwerk 'wwan', protocol DHCP client, firewallzone wan.
+          Instellingen:
+          netwerknaam: wwan
+          protocol: DHCP client
+          firewallzone: wan
           EOF
+
+          ls -lah
 
       - name: Upload OpenWrt USB images
         uses: actions/upload-artifact@v4
