@@ -4,6 +4,27 @@ PORTAL_URL='http://neverssl.com/'
 BODY='/tmp/rdzbridge-connectivity.body'
 rm -f "$BODY"
 
+run_limited() {
+	LIMIT="$1"
+	shift
+
+	"$@" &
+	COMMAND_PID=$!
+	(
+		sleep "$LIMIT"
+		kill -TERM "$COMMAND_PID" 2>/dev/null || true
+		sleep 1
+		kill -KILL "$COMMAND_PID" 2>/dev/null || true
+	) &
+	TIMER_PID=$!
+
+	wait "$COMMAND_PID"
+	RESULT=$?
+	kill "$TIMER_PID" 2>/dev/null || true
+	wait "$TIMER_PID" 2>/dev/null || true
+	return "$RESULT"
+}
+
 WWAN="$(ubus call network.interface.wwan status 2>/dev/null || true)"
 UP="$(printf '%s' "$WWAN" | jsonfilter -e '@.up' 2>/dev/null)"
 IP="$(printf '%s' "$WWAN" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
@@ -25,9 +46,9 @@ ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && PING_OK=true
 nslookup openwrt.org >/dev/null 2>&1 && DNS_OK=true
 
 if command -v uclient-fetch >/dev/null 2>&1; then
-	timeout 12 uclient-fetch -q -O "$BODY" "$CHECK_URL" >/dev/null 2>&1 && HTTP_OK=true
+	run_limited 12 uclient-fetch -q -O "$BODY" "$CHECK_URL" >/dev/null 2>&1 && HTTP_OK=true
 elif command -v wget >/dev/null 2>&1; then
-	timeout 12 wget -q -O "$BODY" "$CHECK_URL" >/dev/null 2>&1 && HTTP_OK=true
+	run_limited 12 wget -q -O "$BODY" "$CHECK_URL" >/dev/null 2>&1 && HTTP_OK=true
 fi
 
 if [ -s "$BODY" ]; then
