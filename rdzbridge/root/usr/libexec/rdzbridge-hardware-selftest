@@ -1,0 +1,93 @@
+#!/bin/sh
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
+}
+
+bool() {
+	[ "$1" = 1 ] && printf true || printf false
+}
+
+WIFI_DEVICE=''
+WIFI_DRIVER=''
+WIFI_PRESENT=0
+WIFI_SCAN=0
+WIFI_ASSOC=0
+WIFI_SSID=''
+WWAN_UP=0
+WWAN_IP=''
+DEFAULT_ROUTE=0
+DNS_OK=0
+INTERNET_OK=0
+ETH_DEVICE=''
+ETH_DRIVER=''
+ETH_PRESENT=0
+ETH_CARRIER=0
+ETH_SPEED=''
+FIREWALL_NAT=0
+FORWARDING=0
+LUCI_OK=0
+
+for D in /sys/class/net/*; do
+	N="${D##*/}"
+	[ "$N" = lo ] && continue
+	DRIVER="$(basename "$(readlink -f "$D/device/driver" 2>/dev/null)" 2>/dev/null)"
+	if [ -d "$D/wireless" ]; then
+		[ -z "$WIFI_DEVICE" ] && WIFI_DEVICE="$N"
+		[ -z "$WIFI_DRIVER" ] && WIFI_DRIVER="$DRIVER"
+		case "$DRIVER" in
+			rtw88_8822ce|rtw_8822ce|rtw88*) WIFI_PRESENT=1 ;;
+		esac
+	else
+		if [ "$DRIVER" = r8169 ]; then
+			ETH_DEVICE="$N"
+			ETH_DRIVER="$DRIVER"
+			ETH_PRESENT=1
+		fi
+	fi
+done
+
+if [ -n "$WIFI_DEVICE" ]; then
+	iwinfo "$WIFI_DEVICE" scan >/tmp/rdz-selftest-scan.txt 2>&1 && WIFI_SCAN=1
+	WIFI_SSID="$(iwinfo "$WIFI_DEVICE" info 2>/dev/null | sed -n 's/^[[:space:]]*ESSID: "\(.*\)"/\1/p' | head -n1)"
+	[ -n "$WIFI_SSID" ] && [ "$WIFI_SSID" != unknown ] && WIFI_ASSOC=1
+fi
+
+if [ -n "$ETH_DEVICE" ]; then
+	CARRIER="$(cat "/sys/class/net/$ETH_DEVICE/carrier" 2>/dev/null || echo 0)"
+	[ "$CARRIER" = 1 ] && ETH_CARRIER=1
+	ETH_SPEED="$(cat "/sys/class/net/$ETH_DEVICE/speed" 2>/dev/null || true)"
+fi
+
+WWAN="$(ubus call network.interface.wwan status 2>/dev/null || true)"
+[ "$(printf '%s' "$WWAN" | jsonfilter -e '@.up' 2>/dev/null)" = true ] && WWAN_UP=1
+WWAN_IP="$(printf '%s' "$WWAN" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+[ -n "$WWAN_IP" ] || WWAN_IP=''
+printf '%s' "$WWAN" | jsonfilter -e '@.route[*].target' 2>/dev/null | grep -qx '0.0.0.0' && DEFAULT_ROUTE=1
+
+nslookup openwrt.org >/tmp/rdz-selftest-dns.txt 2>&1 && DNS_OK=1
+ping -c 1 -W 2 1.1.1.1 >/tmp/rdz-selftest-ping.txt 2>&1 && INTERNET_OK=1
+
+WAN_SECTION="$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.name='wan'$/\1/p" | head -n1)"
+[ -n "$WAN_SECTION" ] && [ "$(uci -q get "firewall.$WAN_SECTION.masq")" = 1 ] && FIREWALL_NAT=1
+for SECTION in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.src='lan'$/\1/p"); do
+	[ "$(uci -q get "firewall.$SECTION.dest")" = wan ] && FORWARDING=1
+done
+
+wget -q -O /dev/null http://127.0.0.1/cgi-bin/luci/ >/dev/null 2>&1 && LUCI_OK=1
+
+OVERALL=1
+for CHECK in "$WIFI_PRESENT" "$WIFI_SCAN" "$ETH_PRESENT" "$ETH_CARRIER" "$LUCI_OK"; do
+	[ "$CHECK" = 1 ] || OVERALL=0
+done
+
+printf '{'
+printf '"overall":%s,' "$(bool "$OVERALL")"
+printf '"wifi":{"present":%s,"device":"%s","driver":"%s","scan":%s,"associated":%s,"ssid":"%s"},' \
+	"$(bool "$WIFI_PRESENT")" "$(json_escape "$WIFI_DEVICE")" "$(json_escape "$WIFI_DRIVER")" "$(bool "$WIFI_SCAN")" "$(bool "$WIFI_ASSOC")" "$(json_escape "$WIFI_SSID")"
+printf '"wwan":{"up":%s,"ip":"%s","default_route":%s},' "$(bool "$WWAN_UP")" "$(json_escape "$WWAN_IP")" "$(bool "$DEFAULT_ROUTE")"
+printf '"ethernet":{"present":%s,"device":"%s","driver":"%s","carrier":%s,"speed":"%s"},' \
+	"$(bool "$ETH_PRESENT")" "$(json_escape "$ETH_DEVICE")" "$(json_escape "$ETH_DRIVER")" "$(bool "$ETH_CARRIER")" "$(json_escape "$ETH_SPEED")"
+printf '"routing":{"nat":%s,"lan_to_wan":%s},' "$(bool "$FIREWALL_NAT")" "$(bool "$FORWARDING")"
+printf '"services":{"luci":%s,"dns":%s,"internet":%s}' "$(bool "$LUCI_OK")" "$(bool "$DNS_OK")" "$(bool "$INTERNET_OK")"
+printf '}\n'
