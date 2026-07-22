@@ -1,8 +1,38 @@
 #!/bin/sh
+set -eu
 
-# Remove this transient uci-default before starting the permanent finalizer.
-# This makes repeated/manual execution safe and prevents CI or recovery logic
-# from observing a stale first-boot script while configuration is still active.
-rm -f "$0" 2>/dev/null || true
+WRAPPER_LOG='/etc/rdzbridge-wrapper.log'
+READY='/etc/rdzbridge-ready.json'
+SELF='/etc/uci-defaults/98-rdzbridge-finalize'
 
-# Enable a permanent recovery path before applying the configuration.
+exec >>"$WRAPPER_LOG" 2>&1
+
+echo "RDZ wrapper start: $(date -Iseconds 2>/dev/null || date)"
+
+[ -x /usr/libexec/rdzbridge-finalize ] || {
+	echo 'ERROR: permanent RDZ finalizer is missing or not executable'
+	exit 1
+}
+
+# Enable the recovery path before applying the main configuration. If the
+# finalizer fails, this wrapper remains present and recovery retries next boot.
+/etc/init.d/rdzbridge-recovery enable >/dev/null 2>&1 || true
+
+/usr/libexec/rdzbridge-finalize
+
+[ -s "$READY" ] || {
+	echo 'ERROR: finalizer returned without creating the ready marker'
+	exit 1
+}
+
+STATUS="$(jsonfilter -i "$READY" -e '@.status' 2>/dev/null || true)"
+[ "$STATUS" = ready ] || {
+	echo "ERROR: unexpected ready-marker status: ${STATUS:-missing}"
+	cat "$READY" 2>/dev/null || true
+	exit 1
+}
+
+rm -f "$SELF"
+echo "RDZ wrapper complete: $(cat "$READY")"
+sync
+exit 0
