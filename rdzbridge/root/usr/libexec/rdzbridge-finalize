@@ -186,5 +186,7 @@ sync
 # Check LuCI accessibility in the background so init.d/boot can proceed
 # without waiting.  netifd and rpcd start asynchronously after the first-boot
 # UCI commit; a background check avoids gating service startup on their readiness.
+# The background subshell inherits the exec-redirected log FD above, so any
+# warning is preserved in $LOG.
 ( wait_for_http || echo 'WARNING: LuCI not yet reachable on http://127.0.0.1; it will become available once services finish starting' ) &
 exit 0
