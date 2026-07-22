@@ -31,7 +31,7 @@ ensure_section() {
 }
 
 wait_for_http() {
-	MAX_HTTP_WAIT_SECONDS=60
+	MAX_HTTP_WAIT_SECONDS=120
 	SLEEP_SECONDS=1
 	ATTEMPTS_REMAINING="$(( MAX_HTTP_WAIT_SECONDS / SLEEP_SECONDS ))"
 	while [ "$ATTEMPTS_REMAINING" -gt 0 ]; do
@@ -173,7 +173,7 @@ printf '%s\n' "$BRIDGE_PORTS" | grep -Fxq "$ETH" || fail "$ETH is not assigned t
 /etc/init.d/rdzbridge-watchdog enabled >/dev/null 2>&1 || fail 'RDZ watchdog is not enabled'
 /etc/init.d/rdzbridge-recovery enabled >/dev/null 2>&1 || fail 'RDZ recovery service is not enabled'
 /etc/init.d/uhttpd enabled >/dev/null 2>&1 || fail 'LuCI webserver is not enabled'
-wait_for_http || fail 'LuCI did not become reachable on http://127.0.0.1 within 60 seconds'
+wait_for_http || fail 'LuCI did not become reachable on http://127.0.0.1 within 120 seconds'
 
 cat > "$READY" <<EOF_READY
 {"status":"ready","lan_ip":"10.77.77.1","lan_device":"br-lan","ethernet":"$ETH","driver":"${DRIVER:-unknown}","watchdog":"enabled","recovery":"enabled","luci":"http://10.77.77.1","hardware_selftest":"available"}
