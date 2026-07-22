@@ -1,6 +1,14 @@
 #!/bin/sh
 set -e
 
+LOG='/etc/rdzbridge-firstboot.log'
+READY='/etc/rdzbridge-ready.json'
+rm -f "$READY"
+exec >"$LOG" 2>&1
+
+echo "RDZ first boot started: $(date -Iseconds 2>/dev/null || date)"
+
+echo 'Configuring LAN and DHCP'
 uci set network.lan.proto='static'
 uci set network.lan.ipaddr='10.77.77.1'
 uci set network.lan.netmask='255.255.255.0'
@@ -10,30 +18,40 @@ uci set dhcp.lan.start='100'
 uci set dhcp.lan.limit='150'
 uci set dhcp.lan.leasetime='12h'
 
-ETH=""
-FALLBACK=""
+ETH=''
+FALLBACK=''
+DRIVER=''
 for D in /sys/class/net/*; do
 	N="${D##*/}"
 	[ "$N" = lo ] && continue
 	[ -d "$D/wireless" ] && continue
 	[ -e "$D/device" ] || continue
 	[ -z "$FALLBACK" ] && FALLBACK="$N"
-	DRIVER="$(basename "$(readlink -f "$D/device/driver" 2>/dev/null)" 2>/dev/null)"
-	if [ "$DRIVER" = r8169 ]; then
+	CURRENT_DRIVER="$(basename "$(readlink -f "$D/device/driver" 2>/dev/null)" 2>/dev/null)"
+	if [ "$CURRENT_DRIVER" = r8169 ]; then
 		ETH="$N"
+		DRIVER="$CURRENT_DRIVER"
 		break
 	fi
 done
-[ -n "$ETH" ] || ETH="$FALLBACK"
 
-if [ -n "$ETH" ]; then
-	uci -q delete network.br_lan
-	uci set network.br_lan='device'
-	uci set network.br_lan.name='br-lan'
-	uci set network.br_lan.type='bridge'
-	uci add_list network.br_lan.ports="$ETH"
-	uci set network.lan.device='br-lan'
+if [ -z "$ETH" ] && [ -n "$FALLBACK" ]; then
+	ETH="$FALLBACK"
+	DRIVER="$(basename "$(readlink -f "/sys/class/net/$ETH/device/driver" 2>/dev/null)" 2>/dev/null)"
 fi
+
+if [ -z "$ETH" ]; then
+	echo 'ERROR: no physical Ethernet interface found'
+	exit 1
+fi
+
+echo "Using Ethernet interface: $ETH (driver: ${DRIVER:-unknown})"
+uci -q delete network.br_lan
+uci set network.br_lan='device'
+uci set network.br_lan.name='br-lan'
+uci set network.br_lan.type='bridge'
+uci add_list network.br_lan.ports="$ETH"
+uci set network.lan.device='br-lan'
 
 uci set uhttpd.main.index_page='/cgi-bin/luci/admin/rdzbridge/overview'
 uci set dropbear.@dropbear[0].Interface='lan'
@@ -43,9 +61,42 @@ uci commit dhcp
 uci commit uhttpd
 uci commit dropbear
 
+echo 'Enabling RDZ watchdog'
 /etc/init.d/rdzbridge-watchdog enable
 /etc/init.d/rdzbridge-watchdog start 2>/dev/null || true
 /etc/init.d/network reload 2>/dev/null || true
 /etc/init.d/dnsmasq restart 2>/dev/null || true
 rm -f /tmp/luci-indexcache
+
+for REQUIRED in \
+	/www/luci-static/resources/view/rdzbridge/overview.js \
+	/www/luci-static/resources/view/rdzbridge/setup.js \
+	/usr/libexec/rdzbridge-connectivity-status \
+	/etc/config/rdzbridge \
+	/etc/config/network \
+	/etc/config/dhcp \
+	/etc/config/firewall; do
+	if [ ! -s "$REQUIRED" ]; then
+		echo "ERROR: required file missing or empty: $REQUIRED"
+		exit 1
+	fi
+done
+
+grep -q '10.77.77.1' /etc/config/network || {
+	echo 'ERROR: LAN address 10.77.77.1 not committed'
+	exit 1
+}
+
+WATCHDOG_LINK="$(find /etc/rc.d -maxdepth 1 -type l -name '*rdzbridge-watchdog' -print -quit 2>/dev/null)"
+if [ -z "$WATCHDOG_LINK" ]; then
+	echo 'ERROR: watchdog start link missing'
+	exit 1
+fi
+
+cat > "$READY" <<EOF_READY
+{"status":"ready","lan_ip":"10.77.77.1","ethernet":"$ETH","driver":"${DRIVER:-unknown}","watchdog":"enabled"}
+EOF_READY
+chmod 0644 "$READY"
+echo "RDZ first boot completed: $(cat "$READY")"
+sync
 exit 0

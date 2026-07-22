@@ -58,7 +58,7 @@ jobs:
           tar -C rdzbridge/root -czf rdzbridge-root.tar.gz .
           PAYLOAD="$(base64 -w 0 rdzbridge-root.tar.gz)"
 
-          cat > defaults.sh <<'EOF'
+          cat > defaults.sh <<'EOF_DEFAULTS'
           #!/bin/sh
           set -e
 
@@ -77,7 +77,7 @@ jobs:
 
           rm -f /tmp/luci-indexcache
           exit 0
-          EOF
+          EOF_DEFAULTS
 
           sed -i "s|__RDZ_PAYLOAD__|$PAYLOAD|" defaults.sh
 
@@ -105,7 +105,7 @@ jobs:
                 "ethtool"
               ],
               defaults: $defaults,
-              client: "github-actions-rdz/3.4",
+              client: "github-actions-rdz/3.5",
               rootfs_size_mb: 512,
               filesystem: "ext4",
               diff_packages: false
@@ -206,7 +206,7 @@ jobs:
           cd artifact
           sha256sum *.img.gz > RDZ-SHA256SUMS.txt
 
-          cat > README-FIRST.txt <<'EOF'
+          cat > README-FIRST.txt <<'EOF_README'
           RENZODEZWART.PL - OpenWrt x86/64 RDZ 5G Bridge
 
           Hardware:
@@ -229,7 +229,7 @@ jobs:
 
           De image bevat automatische herstelcontrole, captive-portalherkenning,
           diagnostiek en koppelingen voor configuratieback-up en herstel.
-          EOF
+          EOF_README
 
       - name: QEMU first-boot smoke test
         id: qemu_smoke
@@ -238,7 +238,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86
+          sudo apt-get install -y qemu-system-x86 e2fsprogs
 
           LEGACY_IMAGE="$(find artifact -maxdepth 1 -type f -name '*generic-ext4-combined*.img.gz' ! -name '*combined-efi*' | head -n 1)"
           if [[ -z "$LEGACY_IMAGE" ]]; then
@@ -250,7 +250,7 @@ jobs:
           gzip -dc "$LEGACY_IMAGE" > openwrt-rdz-smoke.img
 
           set +e
-          timeout 150s qemu-system-x86_64 \
+          timeout --signal=TERM --kill-after=10s 90s qemu-system-x86_64 \
             -m 512 -smp 2 -nographic -no-reboot \
             -drive file=openwrt-rdz-smoke.img,format=raw,if=ide \
             -netdev user,id=net0 -device e1000,netdev=net0 \
@@ -295,18 +295,36 @@ jobs:
             sleep 1
           done
           test -b "${LOOP}p2"
-          sudo mount -o ro,noload "${LOOP}p2" /mnt/rdz-smoke
+
+          set +e
+          sudo e2fsck -fy "${LOOP}p2" 2>&1 | tee artifact/EXT4-FSCK.log
+          FSCK_RC=${PIPESTATUS[0]}
+          set -e
+          if (( FSCK_RC > 2 )); then
+            echo "EXT4-controle mislukt met code $FSCK_RC" >&2
+            exit 1
+          fi
+
+          sudo mount -o ro "${LOOP}p2" /mnt/rdz-smoke
+          sudo cp /mnt/rdz-smoke/etc/rdzbridge-firstboot.log artifact/RDZ-FIRSTBOOT.log 2>/dev/null || true
+          sudo cp /mnt/rdz-smoke/etc/rdzbridge-ready.json artifact/RDZ-READY.json 2>/dev/null || true
 
           require_file() {
             local path="$1"
             if [[ ! -s "/mnt/rdz-smoke$path" ]]; then
               echo "Bestand ontbreekt of is leeg in image: $path" >&2
-              find /mnt/rdz-smoke -maxdepth 5 -path "*/$(basename "$path")" -print >&2 || true
+              find /mnt/rdz-smoke -maxdepth 6 -path "*/$(basename "$path")" -print >&2 || true
+              if [[ -s artifact/RDZ-FIRSTBOOT.log ]]; then
+                echo '--- RDZ first-bootlog ---' >&2
+                cat artifact/RDZ-FIRSTBOOT.log >&2
+              fi
               exit 1
             fi
             echo "Imagebestand bevestigd: $path"
           }
 
+          require_file /etc/rdzbridge-ready.json
+          require_file /etc/rdzbridge-firstboot.log
           require_file /www/luci-static/resources/view/rdzbridge/overview.js
           require_file /www/luci-static/resources/view/rdzbridge/setup.js
           require_file /usr/libexec/rdzbridge-connectivity-status
@@ -314,6 +332,9 @@ jobs:
           require_file /etc/config/network
           require_file /etc/config/dhcp
           require_file /etc/config/firewall
+
+          jq -e '.status == "ready" and .lan_ip == "10.77.77.1" and .watchdog == "enabled"' \
+            /mnt/rdz-smoke/etc/rdzbridge-ready.json >/dev/null
 
           grep -q '10.77.77.1' /mnt/rdz-smoke/etc/config/network || {
             echo 'LAN-adres 10.77.77.1 ontbreekt in /etc/config/network.' >&2
@@ -329,6 +350,7 @@ jobs:
           if ! find /mnt/rdz-smoke/etc/rc.d -maxdepth 1 -type l -name '*rdzbridge-watchdog' | grep -q .; then
             echo 'Watchdog-startlink ontbreekt.' >&2
             find /mnt/rdz-smoke/etc/rc.d -maxdepth 1 -type l -printf '%f -> %l\n' >&2 || true
+            cat artifact/RDZ-FIRSTBOOT.log >&2 || true
             exit 1
           fi
 
@@ -338,7 +360,7 @@ jobs:
         if: always() && hashFiles('artifact/*.img.gz') != ''
         uses: actions/upload-artifact@v7
         with:
-          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v5
+          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v6
           path: artifact/
           if-no-files-found: error
           retention-days: 30
@@ -354,6 +376,9 @@ jobs:
             build-response.json
             build-stdout.log
             artifact/QEMU-BOOT.log
+            artifact/EXT4-FSCK.log
+            artifact/RDZ-FIRSTBOOT.log
+            artifact/RDZ-READY.json
           if-no-files-found: warn
           retention-days: 14
 
