@@ -62,20 +62,41 @@ jobs:
           #!/bin/sh
           set -e
 
+          ASU_LOG='/etc/rdz-asu-defaults.log'
+          exec >"$ASU_LOG" 2>&1
+          echo "RDZ ASU payload start: $(date -Iseconds 2>/dev/null || date)"
+
+          if ! command -v base64 >/dev/null 2>&1; then
+            echo 'ERROR: base64 decoder is unavailable'
+            exit 1
+          fi
+          if ! command -v tar >/dev/null 2>&1; then
+            echo 'ERROR: tar is unavailable'
+            exit 1
+          fi
+
           cat > /tmp/rdzbridge-root.tar.gz.b64 <<'PAYLOAD_EOF'
           __RDZ_PAYLOAD__
           PAYLOAD_EOF
 
+          echo 'Decoding RDZ payload'
           base64 -d /tmp/rdzbridge-root.tar.gz.b64 > /tmp/rdzbridge-root.tar.gz
+          test -s /tmp/rdzbridge-root.tar.gz
+
+          echo 'Extracting RDZ payload into root filesystem'
           tar -xzf /tmp/rdzbridge-root.tar.gz -C /
           rm -f /tmp/rdzbridge-root.tar.gz /tmp/rdzbridge-root.tar.gz.b64
 
-          if [ -x /etc/uci-defaults/98-rdzbridge-finalize ]; then
-            /etc/uci-defaults/98-rdzbridge-finalize
-            rm -f /etc/uci-defaults/98-rdzbridge-finalize
-          fi
+          test -x /etc/uci-defaults/98-rdzbridge-finalize
+          test -s /www/luci-static/resources/view/rdzbridge/overview.js
+
+          echo 'Running RDZ finalizer'
+          /etc/uci-defaults/98-rdzbridge-finalize
+          rm -f /etc/uci-defaults/98-rdzbridge-finalize
 
           rm -f /tmp/luci-indexcache
+          echo "RDZ ASU payload complete: $(date -Iseconds 2>/dev/null || date)"
+          sync
           exit 0
           EOF_DEFAULTS
 
@@ -92,6 +113,7 @@ jobs:
                 "luci",
                 "luci-ssl",
                 "ca-bundle",
+                "coreutils-base64",
                 "kmod-rtw88-8822ce",
                 "rtl8822ce-firmware",
                 "wireless-regdb",
@@ -105,12 +127,13 @@ jobs:
                 "ethtool"
               ],
               defaults: $defaults,
-              client: "github-actions-rdz/3.6",
+              client: "github-actions-rdz/3.7",
               rootfs_size_mb: 512,
               filesystem: "ext4",
               diff_packages: false
             }' > request.json
 
+          jq -e '.packages | index("coreutils-base64") != null' request.json >/dev/null
           jq -e '.packages | index("kmod-rtw88-8822ce") != null' request.json >/dev/null
           jq -e '.packages | index("kmod-r8169") != null' request.json >/dev/null
           jq -e '.packages | index("uclient-fetch") != null' request.json >/dev/null
@@ -169,7 +192,7 @@ jobs:
           jq -r '.stdout // empty' build-response.json > build-stdout.log
 
           for PACKAGE in \
-            uci netifd dnsmasq dropbear firewall4 uhttpd luci \
+            uci netifd dnsmasq dropbear firewall4 uhttpd luci coreutils-base64 \
             kmod-r8169 kmod-rtw88-8822ce rtl8822ce-firmware r8169-firmware; do
             if ! grep -Eq "Installing ${PACKAGE} \(" build-stdout.log; then
               echo "Essentieel pakket ontbreekt in buildlog: $PACKAGE" >&2
@@ -252,6 +275,14 @@ jobs:
 
           cat > qemu-guest-commands.sh <<'EOF_GUEST'
           echo RDZ_LIVE_TEST_BEGIN
+
+          if command -v base64 >/dev/null 2>&1; then
+            echo RDZ_BASE64_OK
+            command -v base64
+          else
+            echo RDZ_BASE64_MISSING
+          fi
+
           LAN_IP="$(uci -q get network.lan.ipaddr)"
           echo "RDZ_LAN_IP=$LAN_IP"
 
@@ -280,20 +311,29 @@ jobs:
             echo RDZ_WATCHDOG_MISSING
           fi
 
+          echo RDZ_ASU_DEFAULTS_LOG_BEGIN
+          cat /etc/rdz-asu-defaults.log 2>/dev/null || true
+          echo RDZ_ASU_DEFAULTS_LOG_END
+
           echo RDZ_FIRSTBOOT_LOG_BEGIN
           cat /etc/rdzbridge-firstboot.log 2>/dev/null || true
           echo RDZ_FIRSTBOOT_LOG_END
+
+          echo RDZ_UCI_DEFAULTS_REMAINDER_BEGIN
+          ls -la /etc/uci-defaults 2>/dev/null || true
+          echo RDZ_UCI_DEFAULTS_REMAINDER_END
+
           echo RDZ_LIVE_TEST_END
           sync
           poweroff
           EOF_GUEST
 
           {
-            sleep 38
+            sleep 45
             printf '\n'
             sleep 2
             cat qemu-guest-commands.sh
-          } | timeout --signal=TERM --kill-after=10s 110s qemu-system-x86_64 \
+          } | timeout --signal=TERM --kill-after=10s 125s qemu-system-x86_64 \
             -m 512 -smp 2 -nographic -no-reboot \
             -drive file=openwrt-rdz-smoke.img,format=raw,if=ide,cache=none \
             -netdev user,id=net0 -device e1000,netdev=net0 \
@@ -301,10 +341,14 @@ jobs:
 
           QEMU_RC="${QEMU_RC:-0}"
           echo "QEMU exit code: $QEMU_RC"
-          tail -n 220 artifact/QEMU-BOOT.log || true
+          tail -n 260 artifact/QEMU-BOOT.log || true
 
-          if grep -Eiq 'kernel panic|not syncing|unable to mount root|no working init found|uci: not found|netifd: not found|dnsmasq: not found' artifact/QEMU-BOOT.log; then
-            echo 'QEMU-log bevat een fatale boot- of basispakketfout.' >&2
+          sed -n '/RDZ_ASU_DEFAULTS_LOG_BEGIN/,/RDZ_ASU_DEFAULTS_LOG_END/p' artifact/QEMU-BOOT.log > artifact/RDZ-ASU-DEFAULTS.log
+          sed -n '/RDZ_FIRSTBOOT_LOG_BEGIN/,/RDZ_FIRSTBOOT_LOG_END/p' artifact/QEMU-BOOT.log > artifact/RDZ-FIRSTBOOT.log
+          grep -m1 '^{"status":"ready"' artifact/QEMU-BOOT.log > artifact/RDZ-READY.json || true
+
+          if grep -Eiq 'kernel panic|not syncing|unable to mount root|no working init found|uci: not found|netifd: not found|dnsmasq: not found|ERROR: base64 decoder is unavailable' artifact/QEMU-BOOT.log; then
+            echo 'QEMU-log bevat een fatale boot-, basispakket- of payloadfout.' >&2
             exit 1
           fi
 
@@ -325,16 +369,15 @@ jobs:
           require_log 'eth0: .*Link is Up 1000 Mbps Full Duplex|eth0 NIC Link is Up 1000 Mbps Full Duplex' 'Ethernetlink actief op 1 Gbit/s'
           require_log 'br-lan: port 1\(eth0\) entered forwarding state' 'Ethernet gekoppeld aan br-lan'
           require_log 'RDZ_LIVE_TEST_BEGIN' 'live RDZ-test gestart'
+          require_log 'RDZ_BASE64_OK' 'base64-decoder aanwezig'
           require_log 'RDZ_LAN_IP=10\.77\.77\.1' 'LAN-adres is 10.77.77.1'
           require_log 'RDZ_READY_FILE_OK' 'RDZ first-bootmarker aanwezig'
           require_log '"status":"ready"' 'RDZ first boot succesvol afgerond'
+          require_log 'RDZ GUI payload|RDZ ASU payload complete' 'RDZ-payload uitgevoerd'
           require_log 'RDZ_GUI_OVERVIEW_OK' 'overzichts-GUI aanwezig'
           require_log 'RDZ_GUI_SETUP_OK' 'wifiwizard aanwezig'
           require_log 'RDZ_WATCHDOG_OK' 'watchdog geactiveerd'
           require_log 'RDZ_LIVE_TEST_END' 'live RDZ-test afgerond'
-
-          sed -n '/RDZ_FIRSTBOOT_LOG_BEGIN/,/RDZ_FIRSTBOOT_LOG_END/p' artifact/QEMU-BOOT.log > artifact/RDZ-FIRSTBOOT.log
-          grep -m1 '^{"status":"ready"' artifact/QEMU-BOOT.log > artifact/RDZ-READY.json
 
           echo 'QEMU live first boot, Ethernet-LAN en RDZ-configuratie zijn gevalideerd.'
 
@@ -342,7 +385,7 @@ jobs:
         if: always() && hashFiles('artifact/*.img.gz') != ''
         uses: actions/upload-artifact@v7
         with:
-          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v7
+          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v8
           path: artifact/
           if-no-files-found: error
           retention-days: 30
@@ -358,6 +401,7 @@ jobs:
             build-response.json
             build-stdout.log
             artifact/QEMU-BOOT.log
+            artifact/RDZ-ASU-DEFAULTS.log
             artifact/RDZ-FIRSTBOOT.log
             artifact/RDZ-READY.json
           if-no-files-found: warn
