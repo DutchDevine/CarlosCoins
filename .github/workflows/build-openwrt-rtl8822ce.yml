@@ -282,16 +282,13 @@ jobs:
           # Poll boundedly for the bridge interface to become operationally ready.
           # netifd configures the kernel bridge asynchronously after the first-boot
           # finalize exits, so a single-shot sample is unreliable.  br-lan operstate=up
-          # is the primary indicator that both the bridge and its eth0 slave are ready;
-          # the eth0 operstate/carrier checks catch edge cases where the bridge is
-          # still being finalised.
+          # is the definitive indicator: it means netifd has created the bridge, added
+          # eth0 as a slave, and assigned the LAN IP — all in one consistent state.
           ETH_POLL=0
           ETH_IFACE_OK=0
           while [ "$ETH_POLL" -lt 60 ]; do
             BR_OPER="$(cat /sys/class/net/br-lan/operstate 2>/dev/null || echo unknown)"
-            ETH_OPER="$(cat /sys/class/net/eth0/operstate 2>/dev/null || echo unknown)"
-            ETH_CARR="$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0)"
-            if [ "$BR_OPER" = up ] || [ "$ETH_OPER" = up ] || [ "$ETH_CARR" = 1 ]; then
+            if [ "$BR_OPER" = up ]; then
               ETH_IFACE_OK=1
               break
             fi
@@ -314,7 +311,9 @@ jobs:
 
           # Allow a brief settle period for IP address assignment and routing table
           # updates before testing packet transmission.
-          [ "$ETH_IFACE_OK" = 1 ] && sleep 2 || true
+          if [ "$ETH_IFACE_OK" = 1 ]; then
+            sleep 2
+          fi
 
           # Validate packet transmission through the emulated NIC by pinging the LAN
           # bridge address.  This succeeds once br-lan is up with its IP assigned,
