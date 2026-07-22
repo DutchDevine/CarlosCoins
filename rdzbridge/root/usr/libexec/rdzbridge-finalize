@@ -47,10 +47,23 @@ wait_for_service_enabled() {
 	return 1
 }
 
+wait_for_http() {
+	ATTEMPT=0
+	while [ "$ATTEMPT" -lt 15 ]; do
+		if wget -q -O /dev/null http://127.0.0.1/cgi-bin/luci/ >/dev/null 2>&1; then
+			return 0
+		fi
+		ATTEMPT=$((ATTEMPT + 1))
+		sleep 1
+	done
+	return 1
+}
+
 echo "RDZ first boot started: $(date -Iseconds 2>/dev/null || date)"
 
 command -v uci >/dev/null 2>&1 || fail 'uci command is unavailable'
 command -v find >/dev/null 2>&1 || fail 'find command is unavailable'
+command -v wget >/dev/null 2>&1 || fail 'wget command is unavailable'
 
 ensure_section network lan interface
 ensure_section dhcp lan dhcp
@@ -103,8 +116,6 @@ done
 
 echo "Using Ethernet interface: $ETH (driver: ${DRIVER:-unknown})"
 
-# Deleting a non-existing UCI section returns non-zero. It is intentionally
-# non-fatal because this script must be safe on both fresh and repeated boots.
 uci -q delete network.br_lan >/dev/null 2>&1 || true
 uci_set 'network.br_lan=device'
 uci_set 'network.br_lan.name=br-lan'
@@ -112,7 +123,15 @@ uci_set 'network.br_lan.type=bridge'
 uci add_list "network.br_lan.ports=$ETH" || fail "Could not add $ETH to br-lan"
 uci_set 'network.lan.device=br-lan'
 
+# LuCI must always be reachable over plain HTTP on the management LAN.
+uci -q delete uhttpd.main.listen_http >/dev/null 2>&1 || true
+uci add_list 'uhttpd.main.listen_http=0.0.0.0:80' || fail 'Could not configure HTTP listener'
+uci add_list 'uhttpd.main.listen_http=[::]:80' || true
+uci_set 'uhttpd.main.home=/www'
+uci_set 'uhttpd.main.cgi_prefix=/cgi-bin'
+uci_set 'uhttpd.main.redirect_https=0'
 uci_set 'uhttpd.main.index_page=/cgi-bin/luci/admin/rdzbridge/overview'
+
 uci_set 'dropbear.@dropbear[0].Interface=lan'
 uci_set 'dropbear.@dropbear[0].PasswordAuth=on'
 
@@ -121,34 +140,37 @@ uci_commit dhcp
 uci_commit uhttpd
 uci_commit dropbear
 
-# Generate wireless UCI sections when the RTL8822CE radio is already visible.
-# This is harmless on QEMU and makes the first LuCI scan reliable on hardware.
 if command -v wifi >/dev/null 2>&1; then
 	wifi config >/dev/null 2>&1 || true
 fi
 
-echo 'Enabling RDZ watchdog and recovery services'
+echo 'Enabling RDZ services and LuCI'
 /etc/init.d/rdzbridge-watchdog enable || fail 'Could not enable RDZ watchdog'
 /etc/init.d/rdzbridge-recovery enable || fail 'Could not enable RDZ recovery service'
+/etc/init.d/uhttpd enable || fail 'Could not enable LuCI webserver'
 
 wait_for_service_enabled rdzbridge-watchdog 15 || fail 'Watchdog enablement was not visible after 15 seconds'
 wait_for_service_enabled rdzbridge-recovery 15 || fail 'Recovery service enablement was not visible after 15 seconds'
+wait_for_service_enabled uhttpd 15 || fail 'LuCI webserver enablement was not visible after 15 seconds'
 
 /etc/init.d/rdzbridge-watchdog start 2>/dev/null || true
 /etc/init.d/network reload 2>/dev/null || true
 /etc/init.d/dnsmasq restart 2>/dev/null || true
+/etc/init.d/uhttpd restart 2>/dev/null || true
 rm -f /tmp/luci-indexcache
 
 for REQUIRED in \
 	/www/luci-static/resources/view/rdzbridge/overview.js \
 	/www/luci-static/resources/view/rdzbridge/setup.js \
 	/usr/libexec/rdzbridge-connectivity-status \
+	/usr/libexec/rdzbridge-reconnect \
 	/usr/libexec/rdzbridge-finalize \
 	/etc/init.d/rdzbridge-recovery \
 	/etc/config/rdzbridge \
 	/etc/config/network \
 	/etc/config/dhcp \
-	/etc/config/firewall; do
+	/etc/config/firewall \
+	/etc/config/uhttpd; do
 	[ -s "$REQUIRED" ] || fail "Required file missing or empty: $REQUIRED"
 done
 
@@ -161,8 +183,10 @@ LAN_DEVICE="$(uci -q get network.lan.device 2>/dev/null)"
 BRIDGE_PORTS="$(uci -q get network.br_lan.ports 2>/dev/null)"
 printf '%s\n' "$BRIDGE_PORTS" | grep -Fxq "$ETH" || fail "$ETH is not assigned to br-lan"
 
+wait_for_http || fail 'LuCI did not become reachable on http://127.0.0.1 within 15 seconds'
+
 cat > "$READY" <<EOF_READY
-{"status":"ready","lan_ip":"10.77.77.1","lan_device":"br-lan","ethernet":"$ETH","driver":"${DRIVER:-unknown}","watchdog":"enabled","recovery":"enabled"}
+{"status":"ready","lan_ip":"10.77.77.1","lan_device":"br-lan","ethernet":"$ETH","driver":"${DRIVER:-unknown}","watchdog":"enabled","recovery":"enabled","luci":"http://10.77.77.1"}
 EOF_READY
 chmod 0644 "$READY"
 echo "RDZ first boot completed: $(cat "$READY")"
