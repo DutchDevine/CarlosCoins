@@ -309,8 +309,10 @@ jobs:
           ip link show eth0 2>/dev/null || true
           ip link show br-lan 2>/dev/null || true
 
-          # Allow a brief settle period for IP address assignment and routing table
-          # updates before testing packet transmission.
+          # Allow 2 seconds for the IP address and routing table to fully propagate
+          # after the bridge transitions to operstate=up before probing with ping.
+          # netifd assigns the address synchronously with the link-up event, but
+          # a brief kernel settle ensures the address is visible to the network stack.
           if [ "$ETH_IFACE_OK" = 1 ]; then
             sleep 2
           fi

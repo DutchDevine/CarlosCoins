@@ -186,8 +186,9 @@ sync
 # Check LuCI accessibility in the background so init.d/boot can proceed
 # without waiting.  netifd and rpcd start asynchronously after the first-boot
 # UCI commit; a background check avoids gating service startup on their readiness.
-# The background subshell inherits the exec-redirected log FD above, so any
-# warning is preserved in $LOG.  This is a fire-and-forget check; no PID
-# tracking or cleanup is needed for a one-shot init script.
+# The background subshell inherits the redirected log file descriptor set at the
+# top of this script (exec >"$LOG" 2>&1), so any warning is preserved in $LOG.
+# This is a fire-and-forget check; no PID tracking or cleanup is needed for a
+# one-shot init script.
 ( wait_for_http || echo 'WARNING: LuCI not yet reachable on http://127.0.0.1; it will become available once services finish starting' ) &
 exit 0
