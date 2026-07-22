@@ -105,15 +105,16 @@ jobs:
                 "ethtool"
               ],
               defaults: $defaults,
-              client: "github-actions-rdz/3.2",
+              client: "github-actions-rdz/3.3",
               rootfs_size_mb: 512,
               filesystem: "ext4",
-              diff_packages: true
+              diff_packages: false
             }' > request.json
 
           jq -e '.packages | index("kmod-rtw88-8822ce") != null' request.json >/dev/null
           jq -e '.packages | index("kmod-r8169") != null' request.json >/dev/null
           jq -e '.packages | index("uclient-fetch") != null' request.json >/dev/null
+          jq -e '.diff_packages == false' request.json >/dev/null
           jq '{version,target,profile,packages,rootfs_size_mb,filesystem,diff_packages}' request.json
 
           HTTP_CODE="$(curl -4 --silent --show-error --location \
@@ -240,12 +241,15 @@ jobs:
           QEMU_RC=$?
           set -e
           echo "QEMU exit code: $QEMU_RC"
-          tail -n 100 artifact/QEMU-BOOT.log || true
+          tail -n 120 artifact/QEMU-BOOT.log || true
 
-          if grep -Eiq 'kernel panic|not syncing|unable to mount root|no working init found' artifact/QEMU-BOOT.log; then
-            echo 'QEMU-log bevat een fatale Linux-bootfout.' >&2
+          if grep -Eiq 'kernel panic|not syncing|unable to mount root|no working init found|uci: not found|netifd: not found|dnsmasq: not found' artifact/QEMU-BOOT.log; then
+            echo 'QEMU-log bevat een fatale boot- of basispakketfout.' >&2
             exit 1
           fi
+
+          grep -Eq 'VFS: Mounted root .*ext4|EXT4-fs .* re-mounted .* r/w' artifact/QEMU-BOOT.log
+          grep -Eq 'procd: - init -|Please press Enter to activate this console' artifact/QEMU-BOOT.log
 
           sudo mkdir -p /mnt/rdz-smoke
           LOOP="$(sudo losetup --find --show --partscan openwrt-rdz-smoke.img)"
@@ -262,21 +266,30 @@ jobs:
           test -b "${LOOP}p2"
           sudo mount -o ro,noload "${LOOP}p2" /mnt/rdz-smoke
 
+          test -x /mnt/rdz-smoke/sbin/uci
+          test -x /mnt/rdz-smoke/sbin/netifd
+          test -x /mnt/rdz-smoke/usr/sbin/dnsmasq
+          test -x /mnt/rdz-smoke/usr/sbin/dropbear
+          test -x /mnt/rdz-smoke/sbin/fw4
           test -s /mnt/rdz-smoke/www/luci-static/resources/view/rdzbridge/overview.js
           test -s /mnt/rdz-smoke/www/luci-static/resources/view/rdzbridge/setup.js
           test -s /mnt/rdz-smoke/usr/libexec/rdzbridge-connectivity-status
           test -s /mnt/rdz-smoke/etc/config/rdzbridge
+          test -s /mnt/rdz-smoke/etc/config/network
+          test -s /mnt/rdz-smoke/etc/config/dhcp
+          test -s /mnt/rdz-smoke/etc/config/firewall
           test ! -e /mnt/rdz-smoke/etc/uci-defaults/98-rdzbridge-finalize
           grep -q '10.77.77.1' /mnt/rdz-smoke/etc/config/network
+          grep -q "option proto 'static'" /mnt/rdz-smoke/etc/config/network
           find /mnt/rdz-smoke/etc/rc.d -maxdepth 1 -type l -name '*rdzbridge-watchdog' | grep -q .
 
-          echo 'QEMU first-boot and embedded RDZ files validated.'
+          echo 'QEMU first-boot, core router packages and embedded RDZ files validated.'
 
       - name: Upload OpenWrt USB images
         if: always() && hashFiles('artifact/*.img.gz') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v3
+          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v4
           path: artifact/
           if-no-files-found: error
           retention-days: 30
