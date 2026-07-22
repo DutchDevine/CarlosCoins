@@ -30,6 +30,23 @@ ensure_section() {
 	uci -q get "$CONFIG.$SECTION" >/dev/null 2>&1 || uci_set "$CONFIG.$SECTION=$TYPE"
 }
 
+wait_for_service_enabled() {
+	SERVICE="$1"
+	MAX_WAIT="${2:-15}"
+	ATTEMPT=0
+	while [ "$ATTEMPT" -lt "$MAX_WAIT" ]; do
+		if "/etc/init.d/$SERVICE" enabled >/dev/null 2>&1; then
+			return 0
+		fi
+		if find /etc/rc.d -maxdepth 1 -type l -name "*${SERVICE}" -print -quit 2>/dev/null | grep -q .; then
+			return 0
+		fi
+		ATTEMPT=$((ATTEMPT + 1))
+		sleep 1
+	done
+	return 1
+}
+
 echo "RDZ first boot started: $(date -Iseconds 2>/dev/null || date)"
 
 command -v uci >/dev/null 2>&1 || fail 'uci command is unavailable'
@@ -110,8 +127,13 @@ if command -v wifi >/dev/null 2>&1; then
 	wifi config >/dev/null 2>&1 || true
 fi
 
-echo 'Enabling RDZ watchdog'
+echo 'Enabling RDZ watchdog and recovery services'
 /etc/init.d/rdzbridge-watchdog enable || fail 'Could not enable RDZ watchdog'
+/etc/init.d/rdzbridge-recovery enable || fail 'Could not enable RDZ recovery service'
+
+wait_for_service_enabled rdzbridge-watchdog 15 || fail 'Watchdog enablement was not visible after 15 seconds'
+wait_for_service_enabled rdzbridge-recovery 15 || fail 'Recovery service enablement was not visible after 15 seconds'
+
 /etc/init.d/rdzbridge-watchdog start 2>/dev/null || true
 /etc/init.d/network reload 2>/dev/null || true
 /etc/init.d/dnsmasq restart 2>/dev/null || true
@@ -121,6 +143,8 @@ for REQUIRED in \
 	/www/luci-static/resources/view/rdzbridge/overview.js \
 	/www/luci-static/resources/view/rdzbridge/setup.js \
 	/usr/libexec/rdzbridge-connectivity-status \
+	/usr/libexec/rdzbridge-finalize \
+	/etc/init.d/rdzbridge-recovery \
 	/etc/config/rdzbridge \
 	/etc/config/network \
 	/etc/config/dhcp \
@@ -137,11 +161,8 @@ LAN_DEVICE="$(uci -q get network.lan.device 2>/dev/null)"
 BRIDGE_PORTS="$(uci -q get network.br_lan.ports 2>/dev/null)"
 printf '%s\n' "$BRIDGE_PORTS" | grep -Fxq "$ETH" || fail "$ETH is not assigned to br-lan"
 
-WATCHDOG_LINK="$(find /etc/rc.d -maxdepth 1 -type l -name '*rdzbridge-watchdog' -print -quit 2>/dev/null)"
-[ -n "$WATCHDOG_LINK" ] || fail 'Watchdog start link missing'
-
 cat > "$READY" <<EOF_READY
-{"status":"ready","lan_ip":"10.77.77.1","lan_device":"br-lan","ethernet":"$ETH","driver":"${DRIVER:-unknown}","watchdog":"enabled"}
+{"status":"ready","lan_ip":"10.77.77.1","lan_device":"br-lan","ethernet":"$ETH","driver":"${DRIVER:-unknown}","watchdog":"enabled","recovery":"enabled"}
 EOF_READY
 chmod 0644 "$READY"
 echo "RDZ first boot completed: $(cat "$READY")"
