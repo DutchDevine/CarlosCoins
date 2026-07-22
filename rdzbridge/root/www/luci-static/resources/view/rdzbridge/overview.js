@@ -57,10 +57,22 @@ return view.extend({
 
   reconnect: function(button) {
     button.disabled = true;
-    button.textContent = _('Opnieuw verbinden…');
-    return fs.exec_direct('/usr/libexec/rdzbridge-reconnect', []).then(function() {
-      ui.addNotification(null, E('p', {}, _('De WWAN-verbinding wordt opnieuw opgebouwd.')));
-      window.setTimeout(function() { window.location.reload(); }, 3000);
+    button.textContent = _('Verbinden…');
+
+    return fs.exec_direct('/usr/libexec/rdzbridge-reconnect', []).then(function(output) {
+      var result;
+      try {
+        result = JSON.parse(output || '{}');
+      }
+      catch (error) {
+        throw new Error(_('Ongeldig antwoord van de wifi-backend.'));
+      }
+
+      if (!result.ok)
+        throw new Error(result.message || _('De WWAN-verbinding kon niet worden opgebouwd.'));
+
+      ui.addNotification(null, E('p', {}, _('Verbonden. WWAN-adres: %s').format(result.ip || '—')));
+      window.setTimeout(function() { window.location.reload(); }, 1200);
     }).catch(function(error) {
       button.disabled = false;
       button.textContent = _('Wifi opnieuw verbinden');
