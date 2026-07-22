@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+
+START=97
+STOP=10
+
+is_ready() {
+	[ -s /etc/rdzbridge-ready.json ] || return 1
+	STATUS="$(jsonfilter -i /etc/rdzbridge-ready.json -e '@.status' 2>/dev/null)"
+	LAN_IP="$(uci -q get network.lan.ipaddr 2>/dev/null)"
+	LAN_DEVICE="$(uci -q get network.lan.device 2>/dev/null)"
+	[ "$STATUS" = ready ] && [ "$LAN_IP" = 10.77.77.1 ] && [ "$LAN_DEVICE" = br-lan ]
+}
+
+start() {
+	if is_ready; then
+		logger -t rdzbridge-recovery 'RDZ configuration is ready; no repair required'
+		return 0
+	fi
+
+	logger -t rdzbridge-recovery 'RDZ configuration incomplete; running idempotent repair'
+	if /usr/libexec/rdzbridge-finalize; then
+		logger -t rdzbridge-recovery 'RDZ repair completed successfully'
+		return 0
+	fi
+
+	logger -t rdzbridge-recovery 'RDZ repair failed; it will be retried on the next boot'
+	return 1
+}
