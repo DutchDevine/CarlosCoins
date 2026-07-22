@@ -39,7 +39,7 @@ wait_for_http() {
 			return 0
 		fi
 		ATTEMPTS_REMAINING=$((ATTEMPTS_REMAINING - 1))
-		[ "$ATTEMPTS_REMAINING" -gt 0 ] && sleep "$SLEEP_SECONDS"
+		sleep "$SLEEP_SECONDS"
 	done
 	return 1
 }
