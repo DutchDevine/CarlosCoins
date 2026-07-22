@@ -42,6 +42,23 @@ function securityLabel(network) {
   return _('WPA2');
 }
 
+function runReconnect(sectionName) {
+  return fs.exec_direct('/usr/libexec/rdzbridge-reconnect', [ sectionName ]).then(function(output) {
+    var result;
+    try {
+      result = JSON.parse(output || '{}');
+    }
+    catch (error) {
+      throw new Error(_('Ongeldig antwoord van de wifi-backend.'));
+    }
+
+    if (!result.ok)
+      throw new Error(result.message || _('De hotspotverbinding kon niet worden opgebouwd.'));
+
+    return result;
+  });
+}
+
 return view.extend({
   load: function() {
     return uci.load([ 'wireless', 'network', 'firewall' ]);
@@ -94,18 +111,34 @@ return view.extend({
     }
   },
 
-  activateProfile: function(sectionName) {
+  activateProfile: function(sectionName, button) {
     var profiles = this.getProfiles();
     profiles.forEach(function(profile) {
       uci.set('wireless', profile['.name'], 'disabled', profile['.name'] === sectionName ? '0' : '1');
     });
     uci.set('wireless', sectionName, 'rdz_last_used', String(Date.now()));
-
     this.ensureRouting();
+
+    if (button) {
+      button.disabled = true;
+      button.textContent = _('Verbinden…');
+    }
 
     return uci.save()
       .then(function() { return uci.apply(); })
-      .then(function() { return fs.exec_direct('/sbin/ifup', [ 'wwan' ]).catch(function() {}); });
+      .then(function() { return runReconnect(sectionName); })
+      .then(function(result) {
+        notify(_('Verbonden. WWAN-adres: %s').format(result.ip || '—'));
+        window.setTimeout(function() { window.location.href = L.url('admin/rdzbridge/overview'); }, 1200);
+      })
+      .catch(function(error) {
+        if (button) {
+          button.disabled = false;
+          button.textContent = _('Verbinden');
+        }
+        notify(error.message || String(error), true);
+        throw error;
+      });
   },
 
   forgetProfile: function(sectionName) {
@@ -135,12 +168,17 @@ return view.extend({
       uci.set('wireless', profile['.name'], 'disabled', '1');
     });
 
+    uci.set('wireless', radio, 'disabled', '0');
+    if (!uci.get('wireless', radio, 'country'))
+      uci.set('wireless', radio, 'country', 'NL');
+
     uci.set('wireless', sid, 'device', radio);
     uci.set('wireless', sid, 'mode', 'sta');
     uci.set('wireless', sid, 'network', 'wwan');
     uci.set('wireless', sid, 'ssid', network.ssid);
     uci.set('wireless', sid, 'encryption', encryption);
     uci.set('wireless', sid, 'disabled', '0');
+    uci.set('wireless', sid, 'powersave', '0');
     uci.set('wireless', sid, 'rdz_profile', '1');
     uci.set('wireless', sid, 'rdz_last_used', String(Date.now()));
 
@@ -161,7 +199,7 @@ return view.extend({
 
     return uci.save()
       .then(function() { return uci.apply(); })
-      .then(function() { return fs.exec_direct('/sbin/ifup', [ 'wwan' ]).catch(function() {}); });
+      .then(function() { return runReconnect(sid); });
   },
 
   showConnectForm: function(network) {
@@ -185,9 +223,9 @@ return view.extend({
         button.disabled = true;
         button.textContent = _('Verbinden…');
         return this.saveProfile(network, password.value, encryption.value)
-          .then(function() {
-            notify(_('De hotspot is opgeslagen. OpenWrt maakt nu automatisch WWAN, NAT en LAN-naar-WAN-doorsturing aan.'));
-            window.setTimeout(function() { window.location.href = L.url('admin/rdzbridge/overview'); }, 2500);
+          .then(function(result) {
+            notify(_('Verbonden. WWAN-adres: %s').format(result.ip || '—'));
+            window.setTimeout(function() { window.location.href = L.url('admin/rdzbridge/overview'); }, 1200);
           })
           .catch(function(error) {
             button.disabled = false;
@@ -228,23 +266,23 @@ return view.extend({
     host.replaceChildren(E('table', { class: 'table' }, [
       E('tr', { class: 'tr table-titles' }, [
         E('th', { class: 'th' }, _('Hotspot')),
-        E('th', { class: 'th' }, _('Status')),
+        E('th', { class: 'th' }, _('Configuratie')),
         E('th', { class: 'th' }, _('Acties'))
       ])
     ].concat(profiles.map(function(profile) {
       var active = profile.disabled !== '1';
+      var connectButton = E('button', {
+        class: 'btn cbi-button cbi-button-action',
+        click: ui.createHandlerFn(this, function() {
+          return this.activateProfile(profile['.name'], connectButton).catch(function() {});
+        })
+      }, _('Verbinden'));
+
       return E('tr', { class: 'tr' }, [
         E('td', { class: 'td' }, profile.ssid || profile['.name']),
-        E('td', { class: 'td' }, active ? _('Actief') : _('Opgeslagen')),
+        E('td', { class: 'td' }, active ? _('Geselecteerd') : _('Opgeslagen')),
         E('td', { class: 'td' }, [
-          E('button', {
-            class: 'btn cbi-button cbi-button-action',
-            click: ui.createHandlerFn(this, function() {
-              return this.activateProfile(profile['.name'])
-                .then(function() { window.location.href = L.url('admin/rdzbridge/overview'); })
-                .catch(function(error) { notify(error.message || String(error), true); });
-            })
-          }, _('Verbinden')),
+          connectButton,
           ' ',
           E('button', {
             class: 'btn cbi-button cbi-button-negative',
