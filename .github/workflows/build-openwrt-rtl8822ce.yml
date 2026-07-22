@@ -20,22 +20,26 @@ jobs:
       ASU_URL: 'https://sysupgrade.openwrt.org'
 
     steps:
-      - name: Checkout GUI source
+      - name: Checkout source
         uses: actions/checkout@v5
 
       - name: Validate RDZ source tree
         shell: bash
         run: |
           set -Eeuo pipefail
+
           jq empty rdzbridge/root/usr/share/luci/menu.d/luci-app-rdzbridge.json
           jq empty rdzbridge/root/usr/share/rpcd/acl.d/luci-app-rdzbridge.json
 
           for SCRIPT in \
             rdzbridge/root/etc/uci-defaults/98-rdzbridge-finalize \
             rdzbridge/root/etc/init.d/rdzbridge-watchdog \
+            rdzbridge/root/etc/init.d/rdzbridge-recovery \
             rdzbridge/root/usr/sbin/rdzbridge-watchdog \
             rdzbridge/root/usr/libexec/rdzbridge-connectivity-status \
             rdzbridge/root/usr/libexec/rdzbridge-ethernet-status \
+            rdzbridge/root/usr/libexec/rdzbridge-finalize \
+            rdzbridge/root/usr/libexec/rdzbridge-hardware-selftest \
             rdzbridge/root/usr/libexec/rdzbridge-reconnect \
             rdzbridge/root/usr/libexec/rdzbridge-security-status \
             rdzbridge/root/usr/libexec/rdzbridge-watchdog-status; do
@@ -43,18 +47,15 @@ jobs:
             sh -n "$SCRIPT"
           done
 
-          test -s rdzbridge/root/www/luci-static/resources/view/rdzbridge/overview.js
-          test -s rdzbridge/root/www/luci-static/resources/view/rdzbridge/setup.js
-          test -s rdzbridge/root/www/luci-static/resources/view/rdzbridge/diagnostics.js
-          test -s rdzbridge/root/www/luci-static/resources/view/rdzbridge/security.js
-          test -s rdzbridge/root/www/luci-static/resources/view/rdzbridge/maintenance.js
+          for VIEW in overview setup diagnostics security maintenance; do
+            test -s "rdzbridge/root/www/luci-static/resources/view/rdzbridge/${VIEW}.js"
+          done
 
       - name: Request customized image from official OpenWrt builder
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          test -d rdzbridge/root
           tar -C rdzbridge/root -czf rdzbridge-root.tar.gz .
           PAYLOAD="$(base64 -w 0 rdzbridge-root.tar.gz)"
 
@@ -66,33 +67,32 @@ jobs:
           exec >"$ASU_LOG" 2>&1
           echo "RDZ ASU payload start: $(date -Iseconds 2>/dev/null || date)"
 
-          if ! command -v base64 >/dev/null 2>&1; then
+          command -v base64 >/dev/null 2>&1 || {
             echo 'ERROR: base64 decoder is unavailable'
             exit 1
-          fi
-          if ! command -v tar >/dev/null 2>&1; then
+          }
+          command -v tar >/dev/null 2>&1 || {
             echo 'ERROR: tar is unavailable'
             exit 1
-          fi
+          }
 
           cat > /tmp/rdzbridge-root.tar.gz.b64 <<'PAYLOAD_EOF'
           __RDZ_PAYLOAD__
           PAYLOAD_EOF
 
-          echo 'Decoding RDZ payload'
           base64 -d /tmp/rdzbridge-root.tar.gz.b64 > /tmp/rdzbridge-root.tar.gz
           test -s /tmp/rdzbridge-root.tar.gz
-
-          echo 'Extracting RDZ payload into root filesystem'
           tar -xzf /tmp/rdzbridge-root.tar.gz -C /
           rm -f /tmp/rdzbridge-root.tar.gz /tmp/rdzbridge-root.tar.gz.b64
 
           test -x /etc/uci-defaults/98-rdzbridge-finalize
+          test -x /usr/libexec/rdzbridge-finalize
+          test -x /usr/libexec/rdzbridge-reconnect
+          test -x /usr/libexec/rdzbridge-hardware-selftest
           test -s /www/luci-static/resources/view/rdzbridge/overview.js
 
           echo 'Running RDZ finalizer'
           /etc/uci-defaults/98-rdzbridge-finalize
-          rm -f /etc/uci-defaults/98-rdzbridge-finalize
 
           rm -f /tmp/luci-indexcache
           echo "RDZ ASU payload complete: $(date -Iseconds 2>/dev/null || date)"
@@ -127,18 +127,16 @@ jobs:
                 "ethtool"
               ],
               defaults: $defaults,
-              client: "github-actions-rdz/3.7",
+              client: "github-actions-rdz/4.0",
               rootfs_size_mb: 512,
               filesystem: "ext4",
               diff_packages: false
             }' > request.json
 
-          jq -e '.packages | index("coreutils-base64") != null' request.json >/dev/null
-          jq -e '.packages | index("kmod-rtw88-8822ce") != null' request.json >/dev/null
-          jq -e '.packages | index("kmod-r8169") != null' request.json >/dev/null
-          jq -e '.packages | index("uclient-fetch") != null' request.json >/dev/null
           jq -e '.diff_packages == false' request.json >/dev/null
-          jq '{version,target,profile,packages,rootfs_size_mb,filesystem,diff_packages}' request.json
+          for PACKAGE in coreutils-base64 kmod-rtw88-8822ce kmod-r8169 uclient-fetch; do
+            jq -e --arg package "$PACKAGE" '.packages | index($package) != null' request.json >/dev/null
+          done
 
           HTTP_CODE="$(curl -4 --silent --show-error --location \
             --connect-timeout 30 --max-time 120 \
@@ -149,15 +147,11 @@ jobs:
             "$ASU_URL/api/v1/build")"
 
           echo "Initial HTTP status: $HTTP_CODE"
-          cat response.json | jq . || cat response.json
-          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "202" ]]; then
-            echo 'The OpenWrt build server rejected the request.' >&2
-            exit 1
-          fi
+          jq . response.json || cat response.json
+          [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "202" ]]
 
           REQUEST_HASH="$(jq -r '.request_hash // empty' response.json)"
           test -n "$REQUEST_HASH"
-          echo "Request hash: $REQUEST_HASH"
 
           for attempt in $(seq 1 180); do
             HTTP_CODE="$(curl -4 --silent --show-error --location \
@@ -166,16 +160,13 @@ jobs:
               "$ASU_URL/api/v1/build/$REQUEST_HASH")"
             STATUS="$(jq -r '.imagebuilder_status // .detail // "unknown"' response.json 2>/dev/null || echo unknown)"
             echo "Poll $attempt: HTTP $HTTP_CODE, status $STATUS"
+
             if [[ "$HTTP_CODE" == "200" && "$STATUS" == "done" ]]; then
               break
             fi
-            if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "202" ]]; then
-              cat response.json | jq . || cat response.json
-              exit 1
-            fi
+            [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "202" ]]
             if [[ "$attempt" == "180" ]]; then
               echo 'Timed out waiting for the OpenWrt image build.' >&2
-              cat response.json | jq . || cat response.json
               exit 1
             fi
             sleep 10
@@ -188,23 +179,24 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+
           jq -e '.detail == "done" and .imagebuilder_status == "done"' build-response.json >/dev/null
           jq -r '.stdout // empty' build-response.json > build-stdout.log
 
           for PACKAGE in \
             uci netifd dnsmasq dropbear firewall4 uhttpd luci coreutils-base64 \
             kmod-r8169 kmod-rtw88-8822ce rtl8822ce-firmware r8169-firmware; do
-            if ! grep -Eq "Installing ${PACKAGE} \(" build-stdout.log; then
+            grep -Eq "Installing ${PACKAGE} \(" build-stdout.log || {
               echo "Essentieel pakket ontbreekt in buildlog: $PACKAGE" >&2
               exit 1
-            fi
-            echo "Pakket bevestigd: $PACKAGE"
+            }
           done
 
       - name: Download generated USB boot images
         shell: bash
         run: |
           set -Eeuo pipefail
+
           mkdir -p artifact
           BIN_DIR="$(jq -r '.bin_dir // empty' build-response.json)"
           test -n "$BIN_DIR"
@@ -213,10 +205,7 @@ jobs:
             jq -r '.images[]?.name // empty' build-response.json |
             grep -E 'generic-ext4-combined(-efi)?[^/]*\.img\.gz$' || true
           )
-          if [[ "${#IMAGES[@]}" -eq 0 ]]; then
-            jq '.images' build-response.json
-            exit 1
-          fi
+          [[ "${#IMAGES[@]}" -gt 0 ]]
 
           for IMAGE in "${IMAGES[@]}"; do
             curl -4 --fail --show-error --location --retry 5 --retry-delay 5 \
@@ -226,18 +215,20 @@ jobs:
 
           gzip -t artifact/*.img.gz
           cp build-response.json artifact/
-          cd artifact
-          sha256sum *.img.gz > RDZ-SHA256SUMS.txt
+          (
+            cd artifact
+            sha256sum *.img.gz > RDZ-SHA256SUMS.txt
+          )
 
-          cat > README-FIRST.txt <<'EOF_README'
+          cat > artifact/README-FIRST.txt <<'EOF_README'
           RENZODEZWART.PL - OpenWrt x86/64 RDZ 5G Bridge
 
           Hardware:
           - Realtek RTL8822CE wifi, PCI ID 10EC:C822
           - Realtek RTL8111/RTL8168 Ethernet, PCI ID 10EC:8168
 
-          Moderne UEFI-computer: gebruik de image met combined-efi.
-          Legacy BIOS: gebruik de image zonder -efi.
+          Gebruik combined-efi op een moderne UEFI-computer.
+          Gebruik de image zonder -efi alleen voor legacy BIOS.
 
           Schrijf het .img.gz-bestand rechtstreeks naar USB met balenaEtcher
           of Rufus. Schakel Secure Boot zo nodig uit.
@@ -246,45 +237,52 @@ jobs:
 
           Eerste gebruik:
           1. Stel een rootwachtwoord in.
-          2. Kies een wifi-signaal in de RDZ-wizard.
-          3. Vul het wifiwachtwoord in.
+          2. Open de RDZ-wifiwizard.
+          3. Kies de telefoonhotspot en vul het wachtwoord in.
           4. De router configureert WWAN, NAT, DHCP en Ethernet-out automatisch.
-
-          De image bevat automatische herstelcontrole, captive-portalherkenning,
-          diagnostiek en koppelingen voor configuratieback-up en herstel.
           EOF_README
 
-      - name: QEMU live first-boot test
+      - name: QEMU deterministic first-boot test
         id: qemu_smoke
         shell: bash
-        continue-on-error: true
         run: |
           set -Eeuo pipefail
+
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86
 
           LEGACY_IMAGE="$(find artifact -maxdepth 1 -type f -name '*generic-ext4-combined*.img.gz' ! -name '*combined-efi*' | head -n 1)"
-          if [[ -z "$LEGACY_IMAGE" ]]; then
-            echo 'Geen legacy combined EXT4-image gevonden. Beschikbare bestanden:' >&2
-            find artifact -maxdepth 1 -type f -printf '%f\n' >&2
-            exit 1
-          fi
-
-          echo "QEMU test image: $LEGACY_IMAGE"
+          test -n "$LEGACY_IMAGE"
           gzip -dc "$LEGACY_IMAGE" > openwrt-rdz-smoke.img
 
           cat > qemu-guest-commands.sh <<'EOF_GUEST'
           echo RDZ_LIVE_TEST_BEGIN
 
-          if command -v base64 >/dev/null 2>&1; then
-            echo RDZ_BASE64_OK
-            command -v base64
-          else
-            echo RDZ_BASE64_MISSING
-          fi
+          WAIT=0
+          while [ "$WAIT" -lt 75 ]; do
+            if [ -s /etc/rdzbridge-ready.json ]; then
+              STATUS="$(jsonfilter -i /etc/rdzbridge-ready.json -e '@.status' 2>/dev/null)"
+              [ "$STATUS" = ready ] && break
+              [ "$STATUS" = failed ] && break
+            fi
+            WAIT=$((WAIT + 1))
+            sleep 1
+          done
+          echo "RDZ_READY_WAIT_SECONDS=$WAIT"
+
+          command -v base64 >/dev/null 2>&1 && echo RDZ_BASE64_OK || echo RDZ_BASE64_MISSING
 
           LAN_IP="$(uci -q get network.lan.ipaddr)"
+          LAN_DEVICE="$(uci -q get network.lan.device)"
+          BRIDGE_PORTS="$(uci -q get network.br_lan.ports)"
+          ETH_CARRIER="$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo unknown)"
+          ETH_OPERSTATE="$(cat /sys/class/net/eth0/operstate 2>/dev/null || echo unknown)"
+
           echo "RDZ_LAN_IP=$LAN_IP"
+          echo "RDZ_LAN_DEVICE=$LAN_DEVICE"
+          echo "RDZ_BRIDGE_PORTS=$BRIDGE_PORTS"
+          echo "RDZ_ETH_CARRIER=$ETH_CARRIER"
+          echo "RDZ_ETH_OPERSTATE=$ETH_OPERSTATE"
 
           if [ -s /etc/rdzbridge-ready.json ]; then
             echo RDZ_READY_FILE_OK
@@ -293,23 +291,17 @@ jobs:
             echo RDZ_READY_FILE_MISSING
           fi
 
-          if [ -s /www/luci-static/resources/view/rdzbridge/overview.js ]; then
-            echo RDZ_GUI_OVERVIEW_OK
-          else
-            echo RDZ_GUI_OVERVIEW_MISSING
-          fi
+          [ -s /www/luci-static/resources/view/rdzbridge/overview.js ] && echo RDZ_GUI_OVERVIEW_OK || echo RDZ_GUI_OVERVIEW_MISSING
+          [ -s /www/luci-static/resources/view/rdzbridge/setup.js ] && echo RDZ_GUI_SETUP_OK || echo RDZ_GUI_SETUP_MISSING
+          [ -s /www/luci-static/resources/view/rdzbridge/diagnostics.js ] && echo RDZ_GUI_DIAGNOSTICS_OK || echo RDZ_GUI_DIAGNOSTICS_MISSING
+          [ -x /usr/libexec/rdzbridge-reconnect ] && echo RDZ_RECONNECT_OK || echo RDZ_RECONNECT_MISSING
+          [ -x /usr/libexec/rdzbridge-hardware-selftest ] && echo RDZ_SELFTEST_OK || echo RDZ_SELFTEST_MISSING
+          [ ! -e /etc/uci-defaults/98-rdzbridge-finalize ] && echo RDZ_TRANSIENT_FINALIZER_REMOVED || echo RDZ_TRANSIENT_FINALIZER_PRESENT
 
-          if [ -s /www/luci-static/resources/view/rdzbridge/setup.js ]; then
-            echo RDZ_GUI_SETUP_OK
-          else
-            echo RDZ_GUI_SETUP_MISSING
-          fi
-
-          if find /etc/rc.d -maxdepth 1 -type l -name '*rdzbridge-watchdog' | grep -q .; then
-            echo RDZ_WATCHDOG_OK
-          else
-            echo RDZ_WATCHDOG_MISSING
-          fi
+          /etc/init.d/rdzbridge-watchdog enabled >/dev/null 2>&1 && echo RDZ_WATCHDOG_OK || echo RDZ_WATCHDOG_MISSING
+          /etc/init.d/rdzbridge-recovery enabled >/dev/null 2>&1 && echo RDZ_RECOVERY_OK || echo RDZ_RECOVERY_MISSING
+          /etc/init.d/uhttpd enabled >/dev/null 2>&1 && echo RDZ_UHTTPD_ENABLED || echo RDZ_UHTTPD_DISABLED
+          wget -q -O /dev/null http://127.0.0.1/cgi-bin/luci/ >/dev/null 2>&1 && echo RDZ_LUCI_HTTP_OK || echo RDZ_LUCI_HTTP_FAILED
 
           echo RDZ_ASU_DEFAULTS_LOG_BEGIN
           cat /etc/rdz-asu-defaults.log 2>/dev/null || true
@@ -319,21 +311,17 @@ jobs:
           cat /etc/rdzbridge-firstboot.log 2>/dev/null || true
           echo RDZ_FIRSTBOOT_LOG_END
 
-          echo RDZ_UCI_DEFAULTS_REMAINDER_BEGIN
-          ls -la /etc/uci-defaults 2>/dev/null || true
-          echo RDZ_UCI_DEFAULTS_REMAINDER_END
-
           echo RDZ_LIVE_TEST_END
           sync
           poweroff
           EOF_GUEST
 
           {
-            sleep 45
+            sleep 28
             printf '\n'
             sleep 2
             cat qemu-guest-commands.sh
-          } | timeout --signal=TERM --kill-after=10s 125s qemu-system-x86_64 \
+          } | timeout --signal=TERM --kill-after=10s 150s qemu-system-x86_64 \
             -m 512 -smp 2 -nographic -no-reboot \
             -drive file=openwrt-rdz-smoke.img,format=raw,if=ide,cache=none \
             -netdev user,id=net0 -device e1000,netdev=net0 \
@@ -341,57 +329,63 @@ jobs:
 
           QEMU_RC="${QEMU_RC:-0}"
           echo "QEMU exit code: $QEMU_RC"
-          tail -n 260 artifact/QEMU-BOOT.log || true
+          tail -n 300 artifact/QEMU-BOOT.log || true
 
           sed -n '/RDZ_ASU_DEFAULTS_LOG_BEGIN/,/RDZ_ASU_DEFAULTS_LOG_END/p' artifact/QEMU-BOOT.log > artifact/RDZ-ASU-DEFAULTS.log
           sed -n '/RDZ_FIRSTBOOT_LOG_BEGIN/,/RDZ_FIRSTBOOT_LOG_END/p' artifact/QEMU-BOOT.log > artifact/RDZ-FIRSTBOOT.log
-          grep -m1 '^{"status":"ready"' artifact/QEMU-BOOT.log > artifact/RDZ-READY.json || true
+          grep -m1 '^{' artifact/QEMU-BOOT.log | grep '"status"' > artifact/RDZ-READY.json || true
 
-          if grep -Eiq 'kernel panic|not syncing|unable to mount root|no working init found|uci: not found|netifd: not found|dnsmasq: not found|ERROR: base64 decoder is unavailable' artifact/QEMU-BOOT.log; then
-            echo 'QEMU-log bevat een fatale boot-, basispakket- of payloadfout.' >&2
+          if grep -Eiq 'kernel panic|not syncing|unable to mount root|no working init found|uci: not found|netifd: not found|dnsmasq: not found|"status":"failed"' artifact/QEMU-BOOT.log; then
+            echo 'QEMU-log bevat een fatale boot- of configuratiefout.' >&2
             exit 1
           fi
 
           require_log() {
             local pattern="$1"
             local description="$2"
-            if ! grep -Eq "$pattern" artifact/QEMU-BOOT.log; then
-              echo "Ontbrekende live bootbevestiging: $description" >&2
+            grep -Eq "$pattern" artifact/QEMU-BOOT.log || {
+              echo "Ontbrekende runtimebevestiging: $description" >&2
               exit 1
-            fi
-            echo "Live bootbevestiging: $description"
+            }
+            echo "Runtimebevestiging: $description"
           }
 
           require_log 'VFS: Mounted root \(ext4 filesystem\)' 'EXT4-rootbestandssysteem gemount'
           require_log 'EXT4-fs .* re-mounted .* r/w' 'rootbestandssysteem schrijfbaar'
-          require_log 'procd: - init -' 'OpenWrt procd init voltooid'
-          require_log 'Please press Enter to activate this console' 'OpenWrt-console beschikbaar'
-          require_log 'eth0: .*Link is Up 1000 Mbps Full Duplex|eth0 NIC Link is Up 1000 Mbps Full Duplex' 'Ethernetlink actief op 1 Gbit/s'
-          require_log 'br-lan: port 1\(eth0\) entered forwarding state' 'Ethernet gekoppeld aan br-lan'
-          require_log 'RDZ_LIVE_TEST_BEGIN' 'live RDZ-test gestart'
+          require_log 'procd: - init -' 'OpenWrt init voltooid'
+          require_log 'RDZ_LIVE_TEST_BEGIN' 'live test gestart'
           require_log 'RDZ_BASE64_OK' 'base64-decoder aanwezig'
-          require_log 'RDZ_LAN_IP=10\.77\.77\.1' 'LAN-adres is 10.77.77.1'
-          require_log 'RDZ_READY_FILE_OK' 'RDZ first-bootmarker aanwezig'
-          require_log '"status":"ready"' 'RDZ first boot succesvol afgerond'
-          require_log 'RDZ GUI payload|RDZ ASU payload complete' 'RDZ-payload uitgevoerd'
+          require_log 'RDZ_LAN_IP=10\.77\.77\.1' 'LAN-adres correct'
+          require_log 'RDZ_LAN_DEVICE=br-lan' 'LAN gekoppeld aan bridge'
+          require_log 'RDZ_BRIDGE_PORTS=.*eth0' 'virtuele Ethernetpoort aan br-lan gekoppeld'
+          require_log 'RDZ_ETH_CARRIER=1' 'virtuele Ethernetcarrier actief'
+          require_log 'RDZ_READY_FILE_OK' 'ready-marker aanwezig'
+          require_log '"status":"ready"' 'first boot volledig afgerond'
           require_log 'RDZ_GUI_OVERVIEW_OK' 'overzichts-GUI aanwezig'
           require_log 'RDZ_GUI_SETUP_OK' 'wifiwizard aanwezig'
-          require_log 'RDZ_WATCHDOG_OK' 'watchdog geactiveerd'
-          require_log 'RDZ_LIVE_TEST_END' 'live RDZ-test afgerond'
+          require_log 'RDZ_GUI_DIAGNOSTICS_OK' 'diagnosepagina aanwezig'
+          require_log 'RDZ_RECONNECT_OK' 'verbindingsbackend aanwezig'
+          require_log 'RDZ_SELFTEST_OK' 'hardwarezelftest aanwezig'
+          require_log 'RDZ_TRANSIENT_FINALIZER_REMOVED' 'tijdelijk first-bootscript verwijderd'
+          require_log 'RDZ_WATCHDOG_OK' 'watchdog enabled'
+          require_log 'RDZ_RECOVERY_OK' 'recoveryservice enabled'
+          require_log 'RDZ_UHTTPD_ENABLED' 'LuCI-webserver enabled'
+          require_log 'RDZ_LUCI_HTTP_OK' 'LuCI lokaal bereikbaar'
+          require_log 'RDZ_LIVE_TEST_END' 'live test afgerond'
 
-          echo 'QEMU live first boot, Ethernet-LAN en RDZ-configuratie zijn gevalideerd.'
+          echo 'Deterministische QEMU first-bootvalidatie geslaagd.'
 
       - name: Upload OpenWrt USB images
         if: always() && hashFiles('artifact/*.img.gz') != ''
         uses: actions/upload-artifact@v7
         with:
-          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v8
+          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v9
           path: artifact/
           if-no-files-found: error
           retention-days: 30
 
       - name: Upload build failure diagnostics
-        if: failure() || steps.qemu_smoke.outcome == 'failure'
+        if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: RDZ-build-failure-diagnostics-${{ github.run_number }}
@@ -406,10 +400,3 @@ jobs:
             artifact/RDZ-READY.json
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Enforce QEMU smoke test result
-        if: steps.qemu_smoke.outcome == 'failure'
-        shell: bash
-        run: |
-          echo 'De QEMU live smoketest is mislukt. Download het diagnose-artifact voor de exacte log.' >&2
-          exit 1
