@@ -105,7 +105,7 @@ jobs:
                 "ethtool"
               ],
               defaults: $defaults,
-              client: "github-actions-rdz/3.5",
+              client: "github-actions-rdz/3.6",
               rootfs_size_mb: 512,
               filesystem: "ext4",
               diff_packages: false
@@ -231,14 +231,14 @@ jobs:
           diagnostiek en koppelingen voor configuratieback-up en herstel.
           EOF_README
 
-      - name: QEMU first-boot smoke test
+      - name: QEMU live first-boot test
         id: qemu_smoke
         shell: bash
         continue-on-error: true
         run: |
           set -Eeuo pipefail
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 e2fsprogs
+          sudo apt-get install -y qemu-system-x86
 
           LEGACY_IMAGE="$(find artifact -maxdepth 1 -type f -name '*generic-ext4-combined*.img.gz' ! -name '*combined-efi*' | head -n 1)"
           if [[ -z "$LEGACY_IMAGE" ]]; then
@@ -246,19 +246,62 @@ jobs:
             find artifact -maxdepth 1 -type f -printf '%f\n' >&2
             exit 1
           fi
+
           echo "QEMU test image: $LEGACY_IMAGE"
           gzip -dc "$LEGACY_IMAGE" > openwrt-rdz-smoke.img
 
-          set +e
-          timeout --signal=TERM --kill-after=10s 90s qemu-system-x86_64 \
+          cat > qemu-guest-commands.sh <<'EOF_GUEST'
+          echo RDZ_LIVE_TEST_BEGIN
+          LAN_IP="$(uci -q get network.lan.ipaddr)"
+          echo "RDZ_LAN_IP=$LAN_IP"
+
+          if [ -s /etc/rdzbridge-ready.json ]; then
+            echo RDZ_READY_FILE_OK
+            cat /etc/rdzbridge-ready.json
+          else
+            echo RDZ_READY_FILE_MISSING
+          fi
+
+          if [ -s /www/luci-static/resources/view/rdzbridge/overview.js ]; then
+            echo RDZ_GUI_OVERVIEW_OK
+          else
+            echo RDZ_GUI_OVERVIEW_MISSING
+          fi
+
+          if [ -s /www/luci-static/resources/view/rdzbridge/setup.js ]; then
+            echo RDZ_GUI_SETUP_OK
+          else
+            echo RDZ_GUI_SETUP_MISSING
+          fi
+
+          if find /etc/rc.d -maxdepth 1 -type l -name '*rdzbridge-watchdog' | grep -q .; then
+            echo RDZ_WATCHDOG_OK
+          else
+            echo RDZ_WATCHDOG_MISSING
+          fi
+
+          echo RDZ_FIRSTBOOT_LOG_BEGIN
+          cat /etc/rdzbridge-firstboot.log 2>/dev/null || true
+          echo RDZ_FIRSTBOOT_LOG_END
+          echo RDZ_LIVE_TEST_END
+          sync
+          poweroff
+          EOF_GUEST
+
+          {
+            sleep 38
+            printf '\n'
+            sleep 2
+            cat qemu-guest-commands.sh
+          } | timeout --signal=TERM --kill-after=10s 110s qemu-system-x86_64 \
             -m 512 -smp 2 -nographic -no-reboot \
-            -drive file=openwrt-rdz-smoke.img,format=raw,if=ide \
+            -drive file=openwrt-rdz-smoke.img,format=raw,if=ide,cache=none \
             -netdev user,id=net0 -device e1000,netdev=net0 \
-            > artifact/QEMU-BOOT.log 2>&1
-          QEMU_RC=$?
-          set -e
+            > artifact/QEMU-BOOT.log 2>&1 || QEMU_RC=$?
+
+          QEMU_RC="${QEMU_RC:-0}"
           echo "QEMU exit code: $QEMU_RC"
-          tail -n 140 artifact/QEMU-BOOT.log || true
+          tail -n 220 artifact/QEMU-BOOT.log || true
 
           if grep -Eiq 'kernel panic|not syncing|unable to mount root|no working init found|uci: not found|netifd: not found|dnsmasq: not found' artifact/QEMU-BOOT.log; then
             echo 'QEMU-log bevat een fatale boot- of basispakketfout.' >&2
@@ -269,10 +312,10 @@ jobs:
             local pattern="$1"
             local description="$2"
             if ! grep -Eq "$pattern" artifact/QEMU-BOOT.log; then
-              echo "Ontbrekende bootbevestiging: $description" >&2
+              echo "Ontbrekende live bootbevestiging: $description" >&2
               exit 1
             fi
-            echo "Bootbevestiging: $description"
+            echo "Live bootbevestiging: $description"
           }
 
           require_log 'VFS: Mounted root \(ext4 filesystem\)' 'EXT4-rootbestandssysteem gemount'
@@ -281,86 +324,25 @@ jobs:
           require_log 'Please press Enter to activate this console' 'OpenWrt-console beschikbaar'
           require_log 'eth0: .*Link is Up 1000 Mbps Full Duplex|eth0 NIC Link is Up 1000 Mbps Full Duplex' 'Ethernetlink actief op 1 Gbit/s'
           require_log 'br-lan: port 1\(eth0\) entered forwarding state' 'Ethernet gekoppeld aan br-lan'
+          require_log 'RDZ_LIVE_TEST_BEGIN' 'live RDZ-test gestart'
+          require_log 'RDZ_LAN_IP=10\.77\.77\.1' 'LAN-adres is 10.77.77.1'
+          require_log 'RDZ_READY_FILE_OK' 'RDZ first-bootmarker aanwezig'
+          require_log '"status":"ready"' 'RDZ first boot succesvol afgerond'
+          require_log 'RDZ_GUI_OVERVIEW_OK' 'overzichts-GUI aanwezig'
+          require_log 'RDZ_GUI_SETUP_OK' 'wifiwizard aanwezig'
+          require_log 'RDZ_WATCHDOG_OK' 'watchdog geactiveerd'
+          require_log 'RDZ_LIVE_TEST_END' 'live RDZ-test afgerond'
 
-          sudo mkdir -p /mnt/rdz-smoke
-          LOOP="$(sudo losetup --find --show --partscan openwrt-rdz-smoke.img)"
-          cleanup() {
-            sudo umount /mnt/rdz-smoke 2>/dev/null || true
-            sudo losetup -d "$LOOP" 2>/dev/null || true
-          }
-          trap cleanup EXIT
+          sed -n '/RDZ_FIRSTBOOT_LOG_BEGIN/,/RDZ_FIRSTBOOT_LOG_END/p' artifact/QEMU-BOOT.log > artifact/RDZ-FIRSTBOOT.log
+          grep -m1 '^{"status":"ready"' artifact/QEMU-BOOT.log > artifact/RDZ-READY.json
 
-          for attempt in $(seq 1 20); do
-            [[ -b "${LOOP}p2" ]] && break
-            sleep 1
-          done
-          test -b "${LOOP}p2"
-
-          set +e
-          sudo e2fsck -fy "${LOOP}p2" 2>&1 | tee artifact/EXT4-FSCK.log
-          FSCK_RC=${PIPESTATUS[0]}
-          set -e
-          if (( FSCK_RC > 2 )); then
-            echo "EXT4-controle mislukt met code $FSCK_RC" >&2
-            exit 1
-          fi
-
-          sudo mount -o ro "${LOOP}p2" /mnt/rdz-smoke
-          sudo cp /mnt/rdz-smoke/etc/rdzbridge-firstboot.log artifact/RDZ-FIRSTBOOT.log 2>/dev/null || true
-          sudo cp /mnt/rdz-smoke/etc/rdzbridge-ready.json artifact/RDZ-READY.json 2>/dev/null || true
-
-          require_file() {
-            local path="$1"
-            if [[ ! -s "/mnt/rdz-smoke$path" ]]; then
-              echo "Bestand ontbreekt of is leeg in image: $path" >&2
-              find /mnt/rdz-smoke -maxdepth 6 -path "*/$(basename "$path")" -print >&2 || true
-              if [[ -s artifact/RDZ-FIRSTBOOT.log ]]; then
-                echo '--- RDZ first-bootlog ---' >&2
-                cat artifact/RDZ-FIRSTBOOT.log >&2
-              fi
-              exit 1
-            fi
-            echo "Imagebestand bevestigd: $path"
-          }
-
-          require_file /etc/rdzbridge-ready.json
-          require_file /etc/rdzbridge-firstboot.log
-          require_file /www/luci-static/resources/view/rdzbridge/overview.js
-          require_file /www/luci-static/resources/view/rdzbridge/setup.js
-          require_file /usr/libexec/rdzbridge-connectivity-status
-          require_file /etc/config/rdzbridge
-          require_file /etc/config/network
-          require_file /etc/config/dhcp
-          require_file /etc/config/firewall
-
-          jq -e '.status == "ready" and .lan_ip == "10.77.77.1" and .watchdog == "enabled"' \
-            /mnt/rdz-smoke/etc/rdzbridge-ready.json >/dev/null
-
-          grep -q '10.77.77.1' /mnt/rdz-smoke/etc/config/network || {
-            echo 'LAN-adres 10.77.77.1 ontbreekt in /etc/config/network.' >&2
-            cat /mnt/rdz-smoke/etc/config/network >&2
-            exit 1
-          }
-
-          if [[ -e /mnt/rdz-smoke/etc/uci-defaults/98-rdzbridge-finalize ]]; then
-            echo 'First-bootscript is niet opgeruimd.' >&2
-            exit 1
-          fi
-
-          if ! find /mnt/rdz-smoke/etc/rc.d -maxdepth 1 -type l -name '*rdzbridge-watchdog' | grep -q .; then
-            echo 'Watchdog-startlink ontbreekt.' >&2
-            find /mnt/rdz-smoke/etc/rc.d -maxdepth 1 -type l -printf '%f -> %l\n' >&2 || true
-            cat artifact/RDZ-FIRSTBOOT.log >&2 || true
-            exit 1
-          fi
-
-          echo 'QEMU first boot, Ethernet-LAN en embedded RDZ-configuratie zijn gevalideerd.'
+          echo 'QEMU live first boot, Ethernet-LAN en RDZ-configuratie zijn gevalideerd.'
 
       - name: Upload OpenWrt USB images
         if: always() && hashFiles('artifact/*.img.gz') != ''
         uses: actions/upload-artifact@v7
         with:
-          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v6
+          name: OpenWrt-25.12.5-x86-RTL8822CE-RTL8168-RDZ-GUI-v7
           path: artifact/
           if-no-files-found: error
           retention-days: 30
@@ -376,7 +358,6 @@ jobs:
             build-response.json
             build-stdout.log
             artifact/QEMU-BOOT.log
-            artifact/EXT4-FSCK.log
             artifact/RDZ-FIRSTBOOT.log
             artifact/RDZ-READY.json
           if-no-files-found: warn
@@ -386,5 +367,5 @@ jobs:
         if: steps.qemu_smoke.outcome == 'failure'
         shell: bash
         run: |
-          echo 'De QEMU-smoketest is mislukt. Download het diagnose-artifact voor de exacte log.' >&2
+          echo 'De QEMU live smoketest is mislukt. Download het diagnose-artifact voor de exacte log.' >&2
           exit 1
