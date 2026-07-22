@@ -1,7 +1,13 @@
 #!/bin/sh
 
 LOG='/tmp/rdzbridge-connect.log'
+LOCKDIR='/tmp/rdzbridge-connect.lock'
+LAST_GOOD='/etc/rdzbridge-last-good-profile'
 PROFILE="${1:-}"
+FALLBACK_USED=false
+ROLLED_BACK=false
+RESULT_PROFILE=''
+RESULT_SSID=''
 : > "$LOG"
 
 log() {
@@ -13,112 +19,234 @@ json_escape() {
 	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'
 }
 
+cleanup() {
+	rm -rf "$LOCKDIR"
+}
+
 result() {
 	OK="$1"
 	STATUS="$2"
 	IP="$3"
 	MESSAGE="$4"
-	printf '{"ok":%s,"status":"%s","ip":"%s","message":"%s","log":"%s"}\n' \
+	printf '{"ok":%s,"status":"%s","ip":"%s","message":"%s","log":"%s","fallback":%s,"rolled_back":%s,"profile":"%s","ssid":"%s"}\n' \
 		"$OK" \
 		"$(json_escape "$STATUS")" \
 		"$(json_escape "$IP")" \
 		"$(json_escape "$MESSAGE")" \
-		"$(json_escape "$LOG")"
+		"$(json_escape "$LOG")" \
+		"$FALLBACK_USED" \
+		"$ROLLED_BACK" \
+		"$(json_escape "$RESULT_PROFILE")" \
+		"$(json_escape "$RESULT_SSID")"
 	exit 0
 }
+
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+	result false busy '' 'Er wordt al een wifi-verbinding opgebouwd. Wacht ongeveer 30 seconden en probeer opnieuw.'
+fi
+trap cleanup 0 1 2 15
+printf '%s\n' "$$" > "$LOCKDIR/pid"
 
 command -v uci >/dev/null 2>&1 || result false error '' 'UCI is niet beschikbaar.'
 command -v ubus >/dev/null 2>&1 || result false error '' 'ubus is niet beschikbaar.'
 command -v wifi >/dev/null 2>&1 || result false error '' 'Het wifi-commando is niet beschikbaar.'
+command -v jsonfilter >/dev/null 2>&1 || result false error '' 'jsonfilter is niet beschikbaar.'
+
+profiles() {
+	uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)\.rdz_profile='1'$/\1/p"
+}
+
+valid_profile() {
+	[ -n "$1" ] && [ "$(uci -q get "wireless.$1.rdz_profile")" = '1' ]
+}
+
+active_profile() {
+	for SECTION in $(profiles); do
+		[ "$(uci -q get "wireless.$SECTION.disabled")" != '1' ] && {
+			echo "$SECTION"
+			return 0
+		}
+	done
+	return 1
+}
 
 if [ -z "$PROFILE" ]; then
-	for SECTION in $(uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)\.rdz_profile='1'$/\1/p"); do
-		if [ "$(uci -q get "wireless.$SECTION.disabled")" != '1' ]; then
-			PROFILE="$SECTION"
-			break
-		fi
-		[ -z "$PROFILE" ] && PROFILE="$SECTION"
-	done
+	PROFILE="$(active_profile)"
 fi
-
 [ -n "$PROFILE" ] || result false no_profile '' 'Er is geen opgeslagen hotspotprofiel gevonden.'
-[ "$(uci -q get "wireless.$PROFILE.rdz_profile")" = '1' ] || result false invalid_profile '' 'Het geselecteerde hotspotprofiel is ongeldig.'
+valid_profile "$PROFILE" || result false invalid_profile '' 'Het geselecteerde hotspotprofiel is ongeldig.'
 
 RADIO="$(uci -q get "wireless.$PROFILE.device")"
 SSID="$(uci -q get "wireless.$PROFILE.ssid")"
+ORIGINAL_ENCRYPTION="$(uci -q get "wireless.$PROFILE.encryption")"
 [ -n "$RADIO" ] || result false no_radio '' 'Het hotspotprofiel verwijst niet naar een wifi-radio.'
 [ -n "$SSID" ] || result false no_ssid '' 'Het hotspotprofiel bevat geen netwerknaam.'
+RESULT_PROFILE="$PROFILE"
+RESULT_SSID="$SSID"
+
+PREVIOUS=''
+if [ -s "$LAST_GOOD" ]; then
+	CANDIDATE="$(cat "$LAST_GOOD" 2>/dev/null)"
+	valid_profile "$CANDIDATE" && [ "$CANDIDATE" != "$PROFILE" ] && PREVIOUS="$CANDIDATE"
+fi
+if [ -z "$PREVIOUS" ]; then
+	for CANDIDATE in $(profiles); do
+		[ "$CANDIDATE" = "$PROFILE" ] && continue
+		if [ "$(uci -q get "wireless.$CANDIDATE.disabled")" != '1' ]; then
+			PREVIOUS="$CANDIDATE"
+			break
+		fi
+	done
+fi
+
+configure_routing() {
+	uci -q get network.wwan >/dev/null 2>&1 || uci set network.wwan=interface
+	uci set network.wwan.proto=dhcp
+	uci set network.wwan.peerdns=1
+	uci set network.wwan.metric=10
+
+	WAN_SECTION="$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.name='wan'$/\1/p" | head -n1)"
+	[ -n "$WAN_SECTION" ] || WAN_SECTION="$(uci add firewall zone)"
+	uci set "firewall.$WAN_SECTION.name=wan"
+	uci set "firewall.$WAN_SECTION.input=REJECT"
+	uci set "firewall.$WAN_SECTION.output=ACCEPT"
+	uci set "firewall.$WAN_SECTION.forward=REJECT"
+	uci set "firewall.$WAN_SECTION.masq=1"
+	uci set "firewall.$WAN_SECTION.mtu_fix=1"
+	WAN_NETWORKS="$(uci -q get "firewall.$WAN_SECTION.network")"
+	case " $WAN_NETWORKS " in
+		*' wwan '*) ;;
+		*) uci add_list "firewall.$WAN_SECTION.network=wwan" ;;
+	esac
+
+	FORWARD_SECTION="$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.src='lan'$/\1/p" | while read -r SECTION; do [ "$(uci -q get "firewall.$SECTION.dest")" = wan ] && { echo "$SECTION"; break; }; done)"
+	if [ -z "$FORWARD_SECTION" ]; then
+		FORWARD_SECTION="$(uci add firewall forwarding)"
+		uci set "firewall.$FORWARD_SECTION.src=lan"
+		uci set "firewall.$FORWARD_SECTION.dest=wan"
+	fi
+}
+
+prepare_profile() {
+	TARGET="$1"
+	ENCRYPTION_OVERRIDE="$2"
+	TARGET_RADIO="$(uci -q get "wireless.$TARGET.device")"
+	[ -n "$TARGET_RADIO" ] || return 1
+
+	for SECTION in $(profiles); do
+		if [ "$SECTION" = "$TARGET" ]; then
+			uci set "wireless.$SECTION.disabled=0" || return 1
+		else
+			uci set "wireless.$SECTION.disabled=1" || true
+		fi
+	done
+
+	uci set "wireless.$TARGET_RADIO.disabled=0" || return 1
+	uci -q get "wireless.$TARGET_RADIO.country" >/dev/null 2>&1 || uci set "wireless.$TARGET_RADIO.country=NL"
+	uci set "wireless.$TARGET.mode=sta"
+	uci set "wireless.$TARGET.network=wwan"
+	uci set "wireless.$TARGET.powersave=0"
+	uci set "wireless.$TARGET.rdz_last_used=$(date +%s 2>/dev/null || echo 0)"
+	[ -n "$ENCRYPTION_OVERRIDE" ] && uci set "wireless.$TARGET.encryption=$ENCRYPTION_OVERRIDE"
+	configure_routing
+	uci commit wireless || return 1
+	uci commit network || return 1
+	uci commit firewall || return 1
+	return 0
+}
+
+restart_and_wait() {
+	WAIT_SECONDS="${1:-25}"
+	/etc/init.d/firewall restart >> "$LOG" 2>&1 || true
+	ifdown wwan >> "$LOG" 2>&1 || true
+	wifi down >> "$LOG" 2>&1 || true
+	sleep 2
+	wifi up >> "$LOG" 2>&1 || return 1
+	sleep 5
+	ifup wwan >> "$LOG" 2>&1 || true
+
+	ATTEMPT=0
+	while [ "$ATTEMPT" -lt "$WAIT_SECONDS" ]; do
+		WWAN="$(ubus call network.interface.wwan status 2>/dev/null || true)"
+		UP="$(printf '%s' "$WWAN" | jsonfilter -e '@.up' 2>/dev/null)"
+		IP="$(printf '%s' "$WWAN" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+		if [ "$UP" = true ] && [ -n "$IP" ]; then
+			printf '%s\n' "$IP"
+			return 0
+		fi
+		ATTEMPT=$((ATTEMPT + 1))
+		sleep 1
+	done
+	return 1
+}
+
+remember_good() {
+	GOOD="$1"
+	for SECTION in $(profiles); do
+		if [ "$SECTION" = "$GOOD" ]; then
+			uci set "wireless.$SECTION.rdz_last_good=1"
+		else
+			uci -q delete "wireless.$SECTION.rdz_last_good" >/dev/null 2>&1 || true
+		fi
+	done
+	uci commit wireless
+	printf '%s\n' "$GOOD" > "$LAST_GOOD"
+	sync
+}
+
+classify_failure() {
+	RECENT="$(logread 2>/dev/null | grep -Ei 'wpa|auth|assoc|rtw|80211|wlan|wwan|sae|psk|dhcp' | tail -n 20)"
+	printf '%s\n' "$RECENT" >> "$LOG"
+	case "$RECENT" in
+		*WRONG_KEY*|*'pre-shared key may be incorrect'*|*'4-Way Handshake failed'*|*'authentication failed'*)
+			echo 'Het wifiwachtwoord is waarschijnlijk onjuist.' ;;
+		*'NETWORK-NOT-FOUND'*|*'No suitable network'*|*'network not found'*)
+			echo 'De hotspot is niet meer gevonden. Controleer of hij aan staat en binnen bereik is.' ;;
+		*SAE*|*sae*|*'key_mgmt'*|*'unsupported'*)
+			echo 'De beveiligingsmethode werd geweigerd. Gebruik WPA2 of WPA2/WPA3 gemengd.' ;;
+		*'associated'*|*'CTRL-EVENT-CONNECTED'*)
+			echo 'Wifi-associatie lukte, maar de telefoon gaf geen DHCP-adres.' ;;
+		*)
+			echo 'Geen WWAN-adres ontvangen. Controleer hotspot, wachtwoord, beveiliging en signaalsterkte.' ;;
+	esac
+}
 
 log "Verbinding opbouwen met profiel $PROFILE ($SSID) via $RADIO"
+prepare_profile "$PROFILE" '' || result false uci_error '' 'De wifi-, WWAN- of firewallinstellingen konden niet worden opgeslagen.'
 
-for SECTION in $(uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)\.rdz_profile='1'$/\1/p"); do
-	if [ "$SECTION" = "$PROFILE" ]; then
-		uci set "wireless.$SECTION.disabled=0" || result false uci_error '' 'Het gekozen hotspotprofiel kon niet worden ingeschakeld.'
-	else
-		uci set "wireless.$SECTION.disabled=1" || true
-	fi
-done
-
-uci set "wireless.$RADIO.disabled=0" || result false uci_error '' 'De wifi-radio kon niet worden ingeschakeld.'
-uci -q get "wireless.$RADIO.country" >/dev/null 2>&1 || uci set "wireless.$RADIO.country=NL"
-uci set "wireless.$PROFILE.mode=sta"
-uci set "wireless.$PROFILE.network=wwan"
-uci set "wireless.$PROFILE.powersave=0"
-uci set "wireless.$PROFILE.rdz_last_used=$(date +%s 2>/dev/null || echo 0)"
-
-uci -q get network.wwan >/dev/null 2>&1 || uci set network.wwan=interface
-uci set network.wwan.proto=dhcp
-uci set network.wwan.peerdns=1
-uci set network.wwan.metric=10
-
-WAN_SECTION="$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.name='wan'$/\1/p" | head -n1)"
-if [ -z "$WAN_SECTION" ]; then
-	WAN_SECTION="$(uci add firewall zone)"
-fi
-uci set "firewall.$WAN_SECTION.name=wan"
-uci set "firewall.$WAN_SECTION.input=REJECT"
-uci set "firewall.$WAN_SECTION.output=ACCEPT"
-uci set "firewall.$WAN_SECTION.forward=REJECT"
-uci set "firewall.$WAN_SECTION.masq=1"
-uci set "firewall.$WAN_SECTION.mtu_fix=1"
-WAN_NETWORKS="$(uci -q get "firewall.$WAN_SECTION.network")"
-case " $WAN_NETWORKS " in
-	*' wwan '*) ;;
-	*) uci add_list "firewall.$WAN_SECTION.network=wwan" ;;
-esac
-
-FORWARD_SECTION="$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.src='lan'$/\1/p" | while read -r SECTION; do [ "$(uci -q get "firewall.$SECTION.dest")" = wan ] && { echo "$SECTION"; break; }; done)"
-if [ -z "$FORWARD_SECTION" ]; then
-	FORWARD_SECTION="$(uci add firewall forwarding)"
-	uci set "firewall.$FORWARD_SECTION.src=lan"
-	uci set "firewall.$FORWARD_SECTION.dest=wan"
+IP="$(restart_and_wait 25)"
+if [ -n "$IP" ]; then
+	remember_good "$PROFILE"
+	log "WWAN verbonden: $IP"
+	result true online "$IP" "Verbonden met $SSID."
 fi
 
-uci commit wireless || result false uci_error '' 'De wifi-instellingen konden niet worden opgeslagen.'
-uci commit network || result false uci_error '' 'De WWAN-instellingen konden niet worden opgeslagen.'
-uci commit firewall || result false uci_error '' 'De firewallinstellingen konden niet worden opgeslagen.'
-
-/etc/init.d/firewall restart >> "$LOG" 2>&1 || true
-ifdown wwan >> "$LOG" 2>&1 || true
-wifi down >> "$LOG" 2>&1 || true
-sleep 2
-wifi up >> "$LOG" 2>&1 || result false wifi_start_failed '' 'De wifi-radio kon niet worden gestart.'
-sleep 5
-ifup wwan >> "$LOG" 2>&1 || true
-
-ATTEMPT=0
-while [ "$ATTEMPT" -lt 25 ]; do
-	WWAN="$(ubus call network.interface.wwan status 2>/dev/null || true)"
-	UP="$(printf '%s' "$WWAN" | jsonfilter -e '@.up' 2>/dev/null)"
-	IP="$(printf '%s' "$WWAN" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
-	if [ "$UP" = true ] && [ -n "$IP" ]; then
-		log "WWAN verbonden: $IP"
-		result true online "$IP" "Verbonden met $SSID."
+if [ "$ORIGINAL_ENCRYPTION" = 'sae-mixed' ] || [ "$ORIGINAL_ENCRYPTION" = 'sae' ]; then
+	FALLBACK_USED=true
+	log 'WPA2/WPA3-poging mislukt; gecontroleerde WPA2-compatibiliteitspoging gestart.'
+	prepare_profile "$PROFILE" psk2 || result false uci_error '' 'De WPA2-fallback kon niet worden ingesteld.'
+	IP="$(restart_and_wait 20)"
+	if [ -n "$IP" ]; then
+		remember_good "$PROFILE"
+		log "WWAN verbonden via WPA2-fallback: $IP"
+		result true online "$IP" "Verbonden met $SSID via WPA2-compatibiliteitsmodus."
 	fi
-	ATTEMPT=$((ATTEMPT + 1))
-	sleep 1
-done
+fi
 
-REASON="$(logread 2>/dev/null | grep -Ei 'wpa|auth|assoc|rtw|80211|wlan|wwan|sae|psk' | tail -n 8 | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g')"
-[ -n "$REASON" ] && log "$REASON"
-result false disconnected '' "Geen verbinding met $SSID. Controleer hotspotwachtwoord, WPA2/WPA3-instelling en signaalsterkte."
+FAILURE_MESSAGE="$(classify_failure)"
+uci set "wireless.$PROFILE.encryption=$ORIGINAL_ENCRYPTION" 2>/dev/null || true
+uci commit wireless 2>/dev/null || true
+
+if valid_profile "$PREVIOUS"; then
+	PREVIOUS_SSID="$(uci -q get "wireless.$PREVIOUS.ssid")"
+	log "Nieuwe verbinding mislukt; vorig werkend profiel $PREVIOUS ($PREVIOUS_SSID) wordt hersteld."
+	prepare_profile "$PREVIOUS" '' && ROLLBACK_IP="$(restart_and_wait 20)"
+	if [ -n "$ROLLBACK_IP" ]; then
+		ROLLED_BACK=true
+		remember_good "$PREVIOUS"
+		log "Rollback geslaagd: $PREVIOUS_SSID via $ROLLBACK_IP"
+		result false rolled_back "$ROLLBACK_IP" "$FAILURE_MESSAGE Vorige verbinding met $PREVIOUS_SSID is automatisch hersteld."
+	fi
+fi
+
+result false disconnected '' "$FAILURE_MESSAGE"
