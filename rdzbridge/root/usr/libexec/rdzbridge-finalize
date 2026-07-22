@@ -38,7 +38,7 @@ wait_for_http() {
 		if wget -q -O /dev/null http://127.0.0.1/cgi-bin/luci/ >/dev/null 2>&1; then
 			return 0
 		fi
-		sleep 1
+		sleep "$SLEEP_SECONDS"
 		ATTEMPTS_REMAINING=$((ATTEMPTS_REMAINING - 1))
 	done
 	return 1
