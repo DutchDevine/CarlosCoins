@@ -7,8 +7,8 @@
 var callInterfaces = rpc.declare({ object: 'network.interface', method: 'dump', expect: { interface: [] } });
 var callBoard = rpc.declare({ object: 'system', method: 'board', expect: {} });
 
-function execJson(path) {
-  return fs.exec_direct(path, []).then(function(output) {
+function execJson(path, args) {
+  return fs.exec_direct(path, args || []).then(function(output) {
     return JSON.parse(output || '{}');
   }).catch(function() { return {}; });
 }
@@ -16,8 +16,12 @@ function execJson(path) {
 function resultBox(title, output, good) {
   return E('div', { class: 'cbi-section' }, [
     E('h3', {}, title),
-    E('pre', { style: 'white-space:pre-wrap;max-height:240px;overflow:auto;border-left:4px solid ' + (good ? '#4caf50' : '#d33') }, output || '—')
+    E('pre', { style: 'white-space:pre-wrap;max-height:260px;overflow:auto;border-left:4px solid ' + (good ? '#4caf50' : '#d33') }, output || '—')
   ]);
+}
+
+function mark(ok) {
+  return E('span', { class: 'label ' + (ok ? 'success' : 'warning') }, ok ? _('OK') : _('Niet gereed'));
 }
 
 return view.extend({
@@ -34,27 +38,59 @@ return view.extend({
   runTests: function(button, host) {
     button.disabled = true;
     button.textContent = _('Testen…');
-    host.replaceChildren(E('p', {}, _('Gateway, internet en DNS worden getest.')));
+    host.replaceChildren(E('p', {}, _('De echte RTL8822CE-, RTL8168-, WWAN-, NAT-, DNS- en LuCI-keten wordt getest.')));
 
-    return Promise.all([
-      fs.exec_direct('/bin/ping', [ '-c', '3', '-W', '2', '1.1.1.1' ]).then(function(v) { return { ok: true, out: v }; }).catch(function(e) { return { ok: false, out: e.message || String(e) }; }),
-      fs.exec_direct('/usr/bin/nslookup', [ 'openwrt.org' ]).then(function(v) { return { ok: true, out: v }; }).catch(function(e) { return { ok: false, out: e.message || String(e) }; })
-    ]).then(function(results) {
-      host.replaceChildren(
-        resultBox(_('Internettest — 1.1.1.1'), results[0].out, results[0].ok),
-        resultBox(_('DNS-test — openwrt.org'), results[1].out, results[1].ok)
-      );
+    return execJson('/usr/libexec/rdzbridge-hardware-selftest').then(function(test) {
+      function row(label, value, ok) {
+        return E('tr', {}, [
+          E('th', { style: 'text-align:left;width:38%' }, label),
+          E('td', {}, [ mark(!!ok), ' ', value || '—' ])
+        ]);
+      }
+
+      var wifi = test.wifi || {};
+      var wwan = test.wwan || {};
+      var ethernet = test.ethernet || {};
+      var routing = test.routing || {};
+      var services = test.services || {};
+
+      host.replaceChildren(E('div', { class: 'cbi-section' }, [
+        E('h3', {}, test.overall ? _('Hardwarezelftest geslaagd') : _('Hardwarezelftest vraagt aandacht')),
+        E('table', { class: 'table' }, [
+          row(_('RTL8822CE-driver'), [ wifi.device, wifi.driver ].filter(Boolean).join(' · '), wifi.present),
+          row(_('Wifi-scan'), wifi.scan ? _('Netwerken kunnen worden gescand') : _('Scannen mislukt'), wifi.scan),
+          row(_('Wifi-associatie'), wifi.associated ? (wifi.ssid || _('Verbonden')) : _('Niet geassocieerd'), wifi.associated),
+          row(_('WWAN DHCP'), wwan.ip || _('Geen IPv4-adres'), wwan.up && !!wwan.ip),
+          row(_('Standaardroute'), wwan.default_route ? _('Aanwezig') : _('Ontbreekt'), wwan.default_route),
+          row(_('RTL8168/r8169'), [ ethernet.device, ethernet.driver ].filter(Boolean).join(' · '), ethernet.present),
+          row(_('Ethernetkabel'), ethernet.carrier ? ((ethernet.speed || '—') + ' Mbit/s') : _('Geen carrier'), ethernet.carrier),
+          row(_('NAT/masquerading'), routing.nat ? _('Actief') : _('Ontbreekt'), routing.nat),
+          row(_('LAN naar WAN'), routing.lan_to_wan ? _('Forwarding actief') : _('Forwarding ontbreekt'), routing.lan_to_wan),
+          row(_('LuCI-webserver'), services.luci ? _('Bereikbaar') : _('Niet bereikbaar'), services.luci),
+          row(_('DNS'), services.dns ? _('Werkend') : _('Niet werkend'), services.dns),
+          row(_('Internet'), services.internet ? _('Bereikbaar') : _('Niet bereikbaar'), services.internet)
+        ])
+      ]));
+    }).catch(function(error) {
+      host.replaceChildren(resultBox(_('Hardwarezelftest mislukt'), error.message || String(error), false));
     }).finally(function() {
       button.disabled = false;
-      button.textContent = _('Diagnose uitvoeren');
+      button.textContent = _('Hardwarezelftest uitvoeren');
     });
   },
 
-  reconnect: function() {
-    return fs.exec_direct('/usr/libexec/rdzbridge-reconnect', []).then(function() {
-      ui.addNotification(null, E('p', {}, _('WWAN wordt opnieuw verbonden.')));
+  reconnect: function(button) {
+    button.disabled = true;
+    button.textContent = _('Herstellen…');
+    return execJson('/usr/libexec/rdzbridge-reconnect').then(function(result) {
+      if (!result.ok)
+        throw new Error(result.message || _('WWAN-herstel mislukt.'));
+      ui.addNotification(null, E('p', {}, result.message || _('WWAN is verbonden.')));
     }).catch(function(error) {
       ui.addNotification(null, E('p', {}, error.message || String(error)), 'error');
+    }).finally(function() {
+      button.disabled = false;
+      button.textContent = _('WWAN herstellen');
     });
   },
 
@@ -79,10 +115,15 @@ return view.extend({
     var testButton = E('button', {
       class: 'btn cbi-button cbi-button-action important',
       click: ui.createHandlerFn(this, function() { return this.runTests(testButton, testHost); })
-    }, _('Diagnose uitvoeren'));
+    }, _('Hardwarezelftest uitvoeren'));
+
+    var reconnectButton = E('button', {
+      class: 'btn cbi-button cbi-button-action',
+      click: ui.createHandlerFn(this, function() { return this.reconnect(reconnectButton); })
+    }, _('WWAN herstellen'));
 
     return E([], [
-      E('h2', {}, _('Diagnose')),
+      E('h2', {}, _('Diagnose en hardwarezelftest')),
       E('div', { class: 'cbi-section' }, [
         E('table', { class: 'table' }, [
           line(_('Model'), board.model),
@@ -107,7 +148,7 @@ return view.extend({
       ]) : null,
       E('div', { style: 'display:flex;gap:.75em;flex-wrap:wrap;margin-top:1em' }, [
         testButton,
-        E('button', { class: 'btn cbi-button cbi-button-action', click: ui.createHandlerFn(this, this.reconnect) }, _('WWAN herstellen')),
+        reconnectButton,
         E('a', { class: 'btn cbi-button', href: L.url('admin/status/logs') }, _('Systeemlog openen')),
         E('a', { class: 'btn cbi-button', href: L.url('admin/system/reboot') }, _('Router herstarten')),
         E('a', { class: 'btn cbi-button', href: L.url('admin/rdzbridge/overview') }, _('Terug'))
