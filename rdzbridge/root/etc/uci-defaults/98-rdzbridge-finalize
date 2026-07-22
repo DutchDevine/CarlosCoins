@@ -1,7 +1,8 @@
 #!/bin/sh
 
-# Enable a permanent recovery path before applying the configuration. If the
-# finalizer fails for any transient reason, the recovery service retries on the
-# next boot instead of leaving the appliance inaccessible.
-/etc/init.d/rdzbridge-recovery enable >/dev/null 2>&1 || true
-exec /usr/libexec/rdzbridge-finalize
+# Remove this transient uci-default before starting the permanent finalizer.
+# This makes repeated/manual execution safe and prevents CI or recovery logic
+# from observing a stale first-boot script while configuration is still active.
+rm -f "$0" 2>/dev/null || true
+
+# Enable a permanent recovery path before applying the configuration.
