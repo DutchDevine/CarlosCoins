@@ -188,7 +188,8 @@ sync
 # UCI commit; a background check avoids gating service startup on their readiness.
 # The background subshell inherits the redirected log file descriptor set at the
 # top of this script (exec >"$LOG" 2>&1), so any warning is preserved in $LOG.
-# This is a fire-and-forget check; no PID tracking or cleanup is needed for a
-# one-shot init script.
+# disown is a bash/zsh extension not present in POSIX sh (BusyBox ash); it is
+# also unnecessary here because orphaned background jobs are naturally reparented
+# to PID 1 when a non-interactive script exits — they are NOT killed by the shell.
 ( wait_for_http || echo 'WARNING: LuCI not yet reachable on http://127.0.0.1; it will become available once services finish starting' ) &
 exit 0

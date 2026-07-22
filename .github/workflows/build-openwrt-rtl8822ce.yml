@@ -284,6 +284,10 @@ jobs:
           # finalize exits, so a single-shot sample is unreliable.  br-lan operstate=up
           # is the definitive indicator: it means netifd has created the bridge, added
           # eth0 as a slave, and assigned the LAN IP — all in one consistent state.
+          # The operstate file may be absent for the first few seconds because netifd
+          # starts after rdzbridge-finalize exits; that is expected and not an error.
+          # We poll the full 60 s to give netifd time to initialise rather than
+          # failing fast on a missing file, which would produce a false failure.
           ETH_POLL=0
           ETH_IFACE_OK=0
           while [ "$ETH_POLL" -lt 60 ]; do
@@ -309,10 +313,11 @@ jobs:
           ip link show eth0 2>/dev/null || true
           ip link show br-lan 2>/dev/null || true
 
-          # Allow 2 seconds for the IP address and routing table to fully propagate
-          # after the bridge transitions to operstate=up before probing with ping.
-          # netifd assigns the address synchronously with the link-up event, but
-          # a brief kernel settle ensures the address is visible to the network stack.
+          # Allow 2 seconds for the kernel network stack to fully process the new
+          # address after the bridge transitions to operstate=up.  netifd assigns
+          # the LAN IP address synchronously as part of the same link-up event, so
+          # the address is already configured — this brief pause lets the loopback
+          # routing entry (127.0.0.0/8 → br-lan gateway) propagate before we probe.
           if [ "$ETH_IFACE_OK" = 1 ]; then
             sleep 2
           fi
