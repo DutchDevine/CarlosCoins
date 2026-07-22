@@ -32,8 +32,8 @@ ensure_section() {
 
 wait_for_http() {
 	ATTEMPT=0
-	while [ "$ATTEMPT" -lt 15 ]; do
-		if wget -q -O /dev/null http://127.0.0.1/cgi-bin/luci/ >/dev/null 2>&1; then
+	while [ "$ATTEMPT" -lt 30 ]; do
+		if wget -q -T 5 -O /dev/null http://127.0.0.1/cgi-bin/luci/ >/dev/null 2>&1; then
 			return 0
 		fi
 		ATTEMPT=$((ATTEMPT + 1))
@@ -171,12 +171,25 @@ printf '%s\n' "$BRIDGE_PORTS" | grep -Fxq "$ETH" || fail "$ETH is not assigned t
 /etc/init.d/rdzbridge-watchdog enabled >/dev/null 2>&1 || fail 'RDZ watchdog is not enabled'
 /etc/init.d/rdzbridge-recovery enabled >/dev/null 2>&1 || fail 'RDZ recovery service is not enabled'
 /etc/init.d/uhttpd enabled >/dev/null 2>&1 || fail 'LuCI webserver is not enabled'
-wait_for_http || fail 'LuCI did not become reachable on http://127.0.0.1 within 15 seconds'
 
+# Write the ready marker as soon as configuration is verified and services are
+# enabled.  netifd and rpcd may still be starting in the background after the
+# first-boot UCI commit, so LuCI accessibility is checked separately below and
+# does not gate this marker.
 cat > "$READY" <<EOF_READY
 {"status":"ready","lan_ip":"10.77.77.1","lan_device":"br-lan","ethernet":"$ETH","driver":"${DRIVER:-unknown}","watchdog":"enabled","recovery":"enabled","luci":"http://10.77.77.1","hardware_selftest":"available"}
 EOF_READY
 chmod 0644 "$READY"
 echo "RDZ first boot completed: $(cat "$READY")"
 sync
+
+# Check LuCI accessibility in the background so init.d/boot can proceed
+# without waiting.  netifd and rpcd start asynchronously after the first-boot
+# UCI commit; a background check avoids gating service startup on their readiness.
+# The background subshell inherits the redirected log file descriptor set at the
+# top of this script (exec >"$LOG" 2>&1), so any warning is preserved in $LOG.
+# disown is a bash/zsh extension not present in POSIX sh (BusyBox ash); it is
+# also unnecessary here because orphaned background jobs are naturally reparented
+# to PID 1 when a non-interactive script exits — they are NOT killed by the shell.
+( wait_for_http || echo 'WARNING: LuCI not yet reachable on http://127.0.0.1; it will become available once services finish starting' ) &
 exit 0

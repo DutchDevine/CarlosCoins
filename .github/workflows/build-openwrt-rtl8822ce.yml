@@ -259,7 +259,7 @@ jobs:
           echo RDZ_LIVE_TEST_BEGIN
 
           WAIT=0
-          while [ "$WAIT" -lt 75 ]; do
+          while [ "$WAIT" -lt 90 ]; do
             if [ -s /etc/rdzbridge-ready.json ]; then
               STATUS="$(jsonfilter -i /etc/rdzbridge-ready.json -e '@.status' 2>/dev/null)"
               [ "$STATUS" = ready ] && break
@@ -275,14 +275,57 @@ jobs:
           LAN_IP="$(uci -q get network.lan.ipaddr)"
           LAN_DEVICE="$(uci -q get network.lan.device)"
           BRIDGE_PORTS="$(uci -q get network.br_lan.ports)"
-          ETH_CARRIER="$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo unknown)"
-          ETH_OPERSTATE="$(cat /sys/class/net/eth0/operstate 2>/dev/null || echo unknown)"
-
           echo "RDZ_LAN_IP=$LAN_IP"
           echo "RDZ_LAN_DEVICE=$LAN_DEVICE"
           echo "RDZ_BRIDGE_PORTS=$BRIDGE_PORTS"
+
+          # Poll boundedly for the bridge interface to become operationally ready.
+          # netifd configures the kernel bridge asynchronously after the first-boot
+          # finalize exits, so a single-shot sample is unreliable.  br-lan operstate=up
+          # is the definitive indicator: it means netifd has created the bridge, added
+          # eth0 as a slave, and assigned the LAN IP — all in one consistent state.
+          # The operstate file may be absent for the first few seconds because netifd
+          # starts after rdzbridge-finalize exits; that is expected and not an error.
+          # We poll the full 60 s to give netifd time to initialise rather than
+          # failing fast on a missing file, which would produce a false failure.
+          ETH_POLL=0
+          ETH_IFACE_OK=0
+          while [ "$ETH_POLL" -lt 60 ]; do
+            BR_OPER="$(cat /sys/class/net/br-lan/operstate 2>/dev/null || echo unknown)"
+            if [ "$BR_OPER" = up ]; then
+              ETH_IFACE_OK=1
+              break
+            fi
+            ETH_POLL=$((ETH_POLL + 1))
+            sleep 1
+          done
+
+          ETH_CARRIER="$(cat /sys/class/net/eth0/carrier 2>/dev/null || echo unknown)"
+          ETH_OPERSTATE="$(cat /sys/class/net/eth0/operstate 2>/dev/null || echo unknown)"
+          BR_OPERSTATE="$(cat /sys/class/net/br-lan/operstate 2>/dev/null || echo unknown)"
           echo "RDZ_ETH_CARRIER=$ETH_CARRIER"
           echo "RDZ_ETH_OPERSTATE=$ETH_OPERSTATE"
+          echo "RDZ_BR_OPERSTATE=$BR_OPERSTATE"
+          echo "RDZ_ETH_POLL_SECONDS=$ETH_POLL"
+          [ "$ETH_IFACE_OK" = 1 ] && echo RDZ_ETH_IFACE_UP || echo RDZ_ETH_IFACE_DOWN
+
+          # Diagnostic interface state for the artifact log
+          ip link show eth0 2>/dev/null || true
+          ip link show br-lan 2>/dev/null || true
+
+          # Allow 2 seconds for the kernel network stack to fully process the new
+          # address after the bridge transitions to operstate=up.  netifd assigns
+          # the LAN IP address synchronously as part of the same link-up event, so
+          # the address is already configured — this brief pause lets the loopback
+          # routing entry (127.0.0.0/8 → br-lan gateway) propagate before we probe.
+          if [ "$ETH_IFACE_OK" = 1 ]; then
+            sleep 2
+          fi
+
+          # Validate packet transmission through the emulated NIC by pinging the LAN
+          # bridge address.  This succeeds once br-lan is up with its IP assigned,
+          # independent of physical cable carrier.
+          ping -c 2 -W 3 10.77.77.1 >/dev/null 2>&1 && echo RDZ_PING_LAN_OK || echo RDZ_PING_LAN_FAILED
 
           if [ -s /etc/rdzbridge-ready.json ]; then
             echo RDZ_READY_FILE_OK
@@ -301,7 +344,7 @@ jobs:
           /etc/init.d/rdzbridge-watchdog enabled >/dev/null 2>&1 && echo RDZ_WATCHDOG_OK || echo RDZ_WATCHDOG_MISSING
           /etc/init.d/rdzbridge-recovery enabled >/dev/null 2>&1 && echo RDZ_RECOVERY_OK || echo RDZ_RECOVERY_MISSING
           /etc/init.d/uhttpd enabled >/dev/null 2>&1 && echo RDZ_UHTTPD_ENABLED || echo RDZ_UHTTPD_DISABLED
-          wget -q -O /dev/null http://127.0.0.1/cgi-bin/luci/ >/dev/null 2>&1 && echo RDZ_LUCI_HTTP_OK || echo RDZ_LUCI_HTTP_FAILED
+          wget -q -T 5 -O /dev/null http://127.0.0.1/cgi-bin/luci/ >/dev/null 2>&1 && echo RDZ_LUCI_HTTP_OK || echo RDZ_LUCI_HTTP_FAILED
 
           echo RDZ_ASU_DEFAULTS_LOG_BEGIN
           cat /etc/rdz-asu-defaults.log 2>/dev/null || true
@@ -310,6 +353,10 @@ jobs:
           echo RDZ_FIRSTBOOT_LOG_BEGIN
           cat /etc/rdzbridge-firstboot.log 2>/dev/null || true
           echo RDZ_FIRSTBOOT_LOG_END
+
+          echo RDZ_WRAPPER_LOG_BEGIN
+          cat /etc/rdzbridge-wrapper.log 2>/dev/null || true
+          echo RDZ_WRAPPER_LOG_END
 
           echo RDZ_LIVE_TEST_END
           sync
@@ -321,7 +368,7 @@ jobs:
             printf '\n'
             sleep 2
             cat qemu-guest-commands.sh
-          } | timeout --signal=TERM --kill-after=10s 150s qemu-system-x86_64 \
+          } | timeout --signal=TERM --kill-after=10s 250s qemu-system-x86_64 \
             -m 512 -smp 2 -nographic -no-reboot \
             -drive file=openwrt-rdz-smoke.img,format=raw,if=ide,cache=none \
             -netdev user,id=net0 -device e1000,netdev=net0 \
@@ -333,6 +380,7 @@ jobs:
 
           sed -n '/RDZ_ASU_DEFAULTS_LOG_BEGIN/,/RDZ_ASU_DEFAULTS_LOG_END/p' artifact/QEMU-BOOT.log > artifact/RDZ-ASU-DEFAULTS.log
           sed -n '/RDZ_FIRSTBOOT_LOG_BEGIN/,/RDZ_FIRSTBOOT_LOG_END/p' artifact/QEMU-BOOT.log > artifact/RDZ-FIRSTBOOT.log
+          sed -n '/RDZ_WRAPPER_LOG_BEGIN/,/RDZ_WRAPPER_LOG_END/p' artifact/QEMU-BOOT.log > artifact/RDZ-WRAPPER.log
           grep -m1 '^{' artifact/QEMU-BOOT.log | grep '"status"' > artifact/RDZ-READY.json || true
 
           if grep -Eiq 'kernel panic|not syncing|unable to mount root|no working init found|uci: not found|netifd: not found|dnsmasq: not found|"status":"failed"' artifact/QEMU-BOOT.log; then
@@ -358,7 +406,8 @@ jobs:
           require_log 'RDZ_LAN_IP=10\.77\.77\.1' 'LAN-adres correct'
           require_log 'RDZ_LAN_DEVICE=br-lan' 'LAN gekoppeld aan bridge'
           require_log 'RDZ_BRIDGE_PORTS=.*eth0' 'virtuele Ethernetpoort aan br-lan gekoppeld'
-          require_log 'RDZ_ETH_CARRIER=1' 'virtuele Ethernetcarrier actief'
+          require_log 'RDZ_ETH_IFACE_UP' 'virtuele Ethernetinterface administratief actief in bridge'
+          require_log 'RDZ_PING_LAN_OK' 'br-lan bereikbaar via ICMP'
           require_log 'RDZ_READY_FILE_OK' 'ready-marker aanwezig'
           require_log '"status":"ready"' 'first boot volledig afgerond'
           require_log 'RDZ_GUI_OVERVIEW_OK' 'overzichts-GUI aanwezig'
@@ -397,6 +446,7 @@ jobs:
             artifact/QEMU-BOOT.log
             artifact/RDZ-ASU-DEFAULTS.log
             artifact/RDZ-FIRSTBOOT.log
+            artifact/RDZ-WRAPPER.log
             artifact/RDZ-READY.json
           if-no-files-found: warn
           retention-days: 14

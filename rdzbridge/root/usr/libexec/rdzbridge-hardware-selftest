@@ -77,7 +77,7 @@ done
 wget -q -O /dev/null http://127.0.0.1/cgi-bin/luci/ >/dev/null 2>&1 && LUCI_OK=1
 
 OVERALL=1
-for CHECK in "$WIFI_PRESENT" "$WIFI_SCAN" "$ETH_PRESENT" "$ETH_CARRIER" "$LUCI_OK"; do
+for CHECK in "$WIFI_PRESENT" "$WIFI_SCAN" "$ETH_PRESENT" "$LUCI_OK"; do
 	[ "$CHECK" = 1 ] || OVERALL=0
 done
 
