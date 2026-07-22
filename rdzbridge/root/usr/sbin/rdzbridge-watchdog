@@ -1,8 +1,20 @@
 #!/bin/sh
 STATE=/tmp/rdzbridge-watchdog.json
 FAIL=/tmp/rdzbridge-watchdog.failures
+LOCKDIR=/tmp/rdzbridge-connect.lock
 ENABLED="$(uci -q get rdzbridge.main.enabled || echo 1)"
 [ "$ENABLED" = 1 ] || { echo '{"enabled":false,"status":"disabled","failures":0,"last_action":"Uitgeschakeld"}' > "$STATE"; exit 0; }
+
+if [ -d "$LOCKDIR" ]; then
+	PID="$(cat "$LOCKDIR/pid" 2>/dev/null)"
+	if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+		printf '{"enabled":true,"status":"connecting","failures":0,"last_action":"Verbindingsprocedure actief; watchdog gepauzeerd","updated":%s}\n' "$(date +%s)" > "$STATE"
+		exit 0
+	fi
+	# Remove a stale lock left by an interrupted process.
+	rm -rf "$LOCKDIR"
+fi
+
 THRESHOLD="$(uci -q get rdzbridge.main.failure_threshold || echo 3)"
 RADIO_THRESHOLD="$(uci -q get rdzbridge.main.radio_restart_threshold || echo 6)"
 F="$(cat "$FAIL" 2>/dev/null || echo 0)"
