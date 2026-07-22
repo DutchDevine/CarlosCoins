@@ -33,7 +33,9 @@ ensure_section() {
 wait_for_http() {
 	MAX_HTTP_WAIT_SECONDS=60
 	WAIT_DEADLINE="$(( $(date +%s) + MAX_HTTP_WAIT_SECONDS ))"
-	while [ "$(date +%s)" -lt "$WAIT_DEADLINE" ]; do
+	while :; do
+		NOW="$(date +%s)"
+		[ "$NOW" -lt "$WAIT_DEADLINE" ] || break
 		if wget -q -O /dev/null http://127.0.0.1/cgi-bin/luci/ >/dev/null 2>&1; then
 			return 0
 		fi
